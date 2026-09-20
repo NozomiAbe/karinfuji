@@ -1,0 +1,11 @@
+[project]
+name = "karinfuji"
+version = "0.1.0"
+description = "Authenticated browser image capture tool"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.48,<2",
+]
+
+[project.scripts]
+karinfuji = "app.phase1:main"

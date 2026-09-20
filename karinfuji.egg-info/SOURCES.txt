@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+app/__init__.py
+app/phase1.py
+karinfuji.egg-info/PKG-INFO
+karinfuji.egg-info/SOURCES.txt
+karinfuji.egg-info/dependency_links.txt
+karinfuji.egg-info/entry_points.txt
+karinfuji.egg-info/requires.txt
+karinfuji.egg-info/top_level.txt

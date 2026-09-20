@@ -1,0 +1,2 @@
+[console_scripts]
+karinfuji = app.phase1:main
