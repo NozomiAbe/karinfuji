@@ -1,847 +1,462 @@
-"""Phase 1 browser and image-response verification tool."""
-
 from __future__ import annotations
-
-import argparse
-import re
-import signal
-import sys
+import argparse, json, re, signal
+from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from playwright.sync_api import Page, Playwright, Response, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-from playwright.sync_api import BrowserContext, Page, Playwright, TimeoutError as PlaywrightTimeoutError, sync_playwright
+SIGNED_KEYS={"expires","signature","key-pair-id","key_pair_id"}
 
+def normalize_url(url:str)->str:
+    p=urlsplit(url)
+    q=[(k,v) for k,v in parse_qsl(p.query,keep_blank_values=True) if k.lower() not in SIGNED_KEYS]
+    return urlunsplit((p.scheme.lower(),p.netloc.lower(),p.path,urlencode(q,doseq=True),""))
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Capture image responses from an authenticated browser page."
-    )
-    parser.add_argument("--url", help="Target image-list page URL")
-    parser.add_argument(
-        "--cdp-url",
-        help="Connect to an already open Chromium started with remote debugging",
-    )
-    parser.add_argument(
-        "--page-url-contains",
-        help="Only monitor the browser tab whose URL contains this text",
-    )
-    parser.add_argument(
-        "--image-selector",
-        help="CSS selector for the image or clickable image element",
-    )
-    parser.add_argument(
-        "--output-dir", type=Path, default=Path("output"), help="Directory for the saved image"
-    )
-    parser.add_argument(
-        "--auth-state",
-        type=Path,
-        default=Path(".data/auth.json"),
-        help="Playwright storage-state JSON file",
-    )
-    parser.add_argument(
-        "--url-contains",
-        default="",
-        help="Only save image responses whose URL contains this text",
-    )
-    parser.add_argument(
-        "--login",
-        action="store_true",
-        help="Open a browser for manual login and save the resulting session",
-    )
-    parser.add_argument(
-        "--watch",
-        action="store_true",
-        help="Save every matching image response until Ctrl+C",
-    )
-    parser.add_argument(
-        "--probe-video",
-        action="store_true",
-        help="Open a media-list page and probe one video tab/item click",
-    )
-    parser.add_argument(
-        "--download-videos",
-        action="store_true",
-        help="Open the video tab and save clicked video/mp4 responses",
-    )
-    parser.add_argument(
-        "--verify-videos",
-        action="store_true",
-        help="Click every visible video item without saving responses",
-    )
-    parser.add_argument(
-        "--scroll-videos",
-        action="store_true",
-        help="Scroll upward and process video items as they become visible",
-    )
-    parser.add_argument(
-        "--save-videos",
-        action="store_true",
-        help="Save video/mp4 responses while using --scroll-videos",
-    )
-    parser.add_argument(
-        "--max-videos",
-        type=int,
-        default=1,
-        help="Maximum number of video items to click (default: 1)",
-    )
-    parser.add_argument(
-        "--click-interval",
-        type=float,
-        default=0.5,
-        help="Minimum seconds between media clicks (default: 0.5)",
-    )
-    parser.add_argument(
-        "--media-list-url",
-        help="Media-list URL used by --probe-video",
-    )
-    parser.add_argument("--video-tab-x", type=float, default=200, help="Video tab X coordinate")
-    parser.add_argument("--video-tab-y", type=float, default=190, help="Video tab Y coordinate")
-    parser.add_argument("--video-item-x", type=float, default=60, help="Video item X coordinate")
-    parser.add_argument("--video-item-y", type=float, default=240, help="Video item Y coordinate")
-    return parser
+def mime(r:Response)->str:return (r.headers.get("content-type") or "").split(";",1)[0].strip().lower()
+def filename(url:str,fallback:str)->str:
+    n=Path(urlsplit(url).path).name or fallback
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',n)
 
+def unique(p:Path)->Path:
+    if not p.exists(): return p
+    for i in range(2,100000):
+        q=p.with_name(f"{p.stem}_{i}{p.suffix}")
+        if not q.exists(): return q
+    raise RuntimeError("保存先を作れません")
 
-def launch_context(playwright: Playwright, auth_state: Path | None) -> BrowserContext:
-    browser = playwright.chromium.launch(headless=False)
-    if auth_state and auth_state.exists():
-        return browser.new_context(storage_state=str(auth_state))
-    return browser.new_context()
+def parse_range(v:str):
+    m=re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+|\*)",v.strip(),re.I)
+    if not m:return None
+    return int(m[1]),int(m[2]),None if m[3]=="*" else int(m[3])
 
-
-def save_login_state(page: Page, auth_state: Path) -> None:
-    input("ブラウザでログインが完了したら、この画面で Enter を押してください: ")
-    auth_state.parent.mkdir(parents=True, exist_ok=True)
-    page.context.storage_state(path=str(auth_state))
-    print(f"ログイン状態を保存しました: {auth_state}")
-
-
-def response_matches(response_url: str, content_type: str, url_filter: str) -> bool:
-    media_type = content_type.split(";", 1)[0].strip().lower()
-    return media_type == "image/jpeg" and url_filter in response_url
-
-
-def capture_responses(page: Page, output_dir: Path, url_filter: str) -> None:
-    output_dir = output_dir / "photo"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    saved_urls: set[str] = set()
-    saved_count = 0
-    pending_responses = []
-    stop_requested = False
-
-    def request_stop(_signal_number, _frame) -> None:
-        nonlocal stop_requested
-        stop_requested = True
-
-    def on_response(response) -> None:
-        content_type = response.headers.get("content-type", "")
-        if response.url in saved_urls or not response_matches(response.url, content_type, url_filter):
-            return
-        pending_responses.append(response)
-
-    def save_response(response) -> None:
-        nonlocal saved_count
-        try:
-            content_type = response.headers.get("content-type", "")
-            body = response.body()
-            extension = ".jpg"
-            filename = Path(urlparse(response.url).path).stem or f"captured-{saved_count + 1}"
-            filename += extension
-            output_path = output_dir / filename
-            if output_path.exists():
-                output_path = output_dir / f"{output_path.stem}-{saved_count + 1}{output_path.suffix}"
-            output_path.write_bytes(body)
-            saved_urls.add(response.url)
-            saved_count += 1
-            print(f"保存しました ({saved_count}): {output_path}")
-        except Exception as error:
-            print(f"画像の保存に失敗しました: {response.url} ({error})", file=sys.stderr)
-
-    def attach_response_listener(target_page: Page) -> None:
-        target_page.on("response", on_response)
-
-    for open_page in page.context.pages:
-        attach_response_listener(open_page)
-    page.context.on("page", attach_response_listener)
-    print(f"画像通信を監視中です。対象タブ: {page.url}")
-    print("終了するには Ctrl+C を押してください。")
-    previous_sigint_handler = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGINT, request_stop)
-    try:
-        while not stop_requested:
-            page.wait_for_timeout(250)
-            while pending_responses:
-                response = pending_responses.pop(0)
-                if response.url not in saved_urls:
-                    save_response(response)
-        print(f"監視を終了しました。保存件数: {saved_count}")
-    finally:
-        signal.signal(signal.SIGINT, previous_sigint_handler)
-
-
-def connect_to_existing_page(
-    playwright: Playwright, cdp_url: str, page_url_contains: str | None
-) -> tuple[object, Page]:
-    try:
-        browser = playwright.chromium.connect_over_cdp(cdp_url, timeout=15_000)
-    except PlaywrightTimeoutError as error:
-        raise RuntimeError(
-            "Edge には接続できましたが、ページの初期化がタイムアウトしました。"
-            "再生用のタブやDevToolsを閉じ、専用Edgeを再起動してから再実行してください。"
-        ) from error
-    pages = [page for context in browser.contexts for page in context.pages]
-    if not pages:
-        raise RuntimeError("接続先ブラウザに開いているページがありません。")
-    if page_url_contains:
-        matching_pages = [page for page in pages if page_url_contains in page.url]
-        if not matching_pages:
-            available_urls = "\n".join(f"- {page.url}" for page in pages)
-            raise RuntimeError(
-                f"URL に一致する監視対象タブがありません: {page_url_contains}\n"
-                f"接続中のタブ:\n{available_urls}"
-            )
-        return browser, matching_pages[-1]
-    return browser, pages[-1]
-
-
-def probe_video_click(
-    page: Page,
-    media_list_url: str,
-    video_tab_x: float,
-    video_tab_y: float,
-    video_item_x: float,
-    video_item_y: float,
-) -> None:
-    responses = []
-
-    def on_response(response) -> None:
-        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if content_type == "video/mp4" or "mp4" in response.url.lower():
-            responses.append((response.status, content_type, response.url))
-
-    def attach_response_listener(target_page: Page) -> None:
-        target_page.on("response", on_response)
-
-    context = page.context
-    for open_page in context.pages:
-        attach_response_listener(open_page)
-    context.on("page", attach_response_listener)
-    page.goto(media_list_url, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
-    print(f"メディア一覧を開きました: {page.url}")
-    semantics_placeholder = page.locator("flt-semantics-placeholder")
-    if semantics_placeholder.count():
-        semantics_placeholder.evaluate("element => element.click()")
-        page.wait_for_timeout(500)
-    tabs = page.locator('[role="tablist"] [role="button"]')
-    if tabs.count() >= 3:
-        print("動画タブをクリックします: tablist内の2番目のボタン")
-        tabs.nth(1).click()
-    else:
-        print(f"動画タブをクリックします: ({video_tab_x}, {video_tab_y})")
-        page.mouse.click(video_tab_x, video_tab_y)
-    page.wait_for_timeout(1000)
-    print(f"動画項目をクリックします: ({video_item_x}, {video_item_y})")
-    page.mouse.click(video_item_x, video_item_y)
-    page.wait_for_timeout(2000)
-
-    if responses:
-        for status, content_type, url in responses:
-            print(f"動画レスポンスを検出しました: {status} {content_type} {url}")
-    else:
-        print("video/mp4 のレスポンスは検出できませんでした。座標または対象項目を確認してください。")
-
-
-def buttons_in_region(page: Page, region: Page | object) -> list[int]:
-    try:
-        region_box = region.bounding_box(timeout=3000)
-    except PlaywrightTimeoutError:
-        return []
-    if not region_box:
-        return []
-    buttons = page.locator('[role="button"]')
-    indices = []
-    for index in range(buttons.count()):
-        button_box = buttons.nth(index).bounding_box()
-        if not button_box:
-            continue
-        overlaps = (
-            button_box["x"] < region_box["x"] + region_box["width"]
-            and button_box["x"] + button_box["width"] > region_box["x"]
-            and button_box["y"] < region_box["y"] + region_box["height"]
-            and button_box["y"] + button_box["height"] > region_box["y"]
-        )
-        if overlaps:
-            indices.append(index)
-    return indices
-
-
-def activate_video_tab(page: Page) -> list[int]:
-    for attempt in range(2):
-        tablist = page.locator('[role="tablist"]').first
-        tab_indices = buttons_in_region(page, tablist)
-        if len(tab_indices) >= 3:
-            page.locator('[role="button"]').nth(tab_indices[1]).click(timeout=5000)
-            page.wait_for_timeout(1000)
-            return buttons_in_region(page, page.locator('[role="tabpanel"]').first)
-        if attempt == 0:
-            placeholder = page.locator("flt-semantics-placeholder")
-            if placeholder.count():
-                placeholder.evaluate("element => element.click()")
-            page.wait_for_timeout(1000)
-    raise RuntimeError("写真・動画・音声のタブをSemanticsから取得できませんでした。ページを再読み込みして再実行してください。")
-
-
-def video_item_targets(page: Page) -> list[tuple[str, int]]:
-    positioned_targets: list[tuple[float, float, str, int, float, float]] = []
-    tablist_box = page.locator('[role="tablist"]').first.bounding_box()
-    tab_bottom = tablist_box["y"] + tablist_box["height"] if tablist_box else 100
-
-    buttons = page.locator('[role="button"]')
-    for index in range(buttons.count()):
-        button_box = buttons.nth(index).bounding_box()
-        if (
-            button_box
-            and button_box["y"] > tab_bottom + 5
-            and button_box["width"] >= 40
-            and button_box["height"] >= 40
-        ):
-            positioned_targets.append(
-                (button_box["y"], button_box["x"], "button", index, button_box["width"], button_box["height"])
-            )
-
-    images = page.locator('[role="img"]')
-    tab_bottom = tablist_box["y"] + tablist_box["height"] if tablist_box else 100
-    for index in range(images.count()):
-        button_box = images.nth(index).bounding_box()
-        if (
-            button_box
-            and button_box["y"] > tab_bottom + 5
-            and button_box["width"] >= 40
-            and button_box["height"] >= 40
-        ):
-            positioned_targets.append(
-                (button_box["y"], button_box["x"], "img", index, button_box["width"], button_box["height"])
-            )
-
-    positioned_targets.sort(key=lambda item: (round(item[0] / 10), item[1]))
-    targets: list[tuple[str, int]] = []
-    seen_boxes: list[tuple[float, float, float, float]] = []
-    for y, x, role, index, width, height in positioned_targets:
-        box = (x, y, width, height)
-        if any(
-            abs(x - old_x) < 2
-            and abs(y - old_y) < 2
-            and abs(width - old_width) < 2
-            and abs(height - old_height) < 2
-            for old_x, old_y, old_width, old_height in seen_boxes
-        ):
-            continue
-        seen_boxes.append(box)
-        targets.append((role, index))
-    return targets
-
-
-def click_video_target(page: Page, target: tuple[str, int]) -> None:
-    role, index = target
-    page.locator(f'[role="{role}"]').nth(index).click(timeout=5000)
-
-
-def combine_video_responses(responses: list[tuple[str, bytes, str]]) -> tuple[str, bytes, bool]:
-    response_url, first_body, _ = responses[0]
-    ranges = []
-    for url, body, content_range in responses:
-        match = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range or "")
-        if match:
-            total = None if match.group(3) == "*" else int(match.group(3))
-            ranges.append((int(match.group(1)), int(match.group(2)), total, body))
-    if not ranges:
-        return response_url, first_body, first_body.startswith(b"ftyp")
-    total_size = max((total for _, _, total, _ in ranges if total is not None), default=None)
-    if total_size is None:
-        ranges.sort(key=lambda item: item[0])
-        combined = b"".join(body for _, _, _, body in ranges)
-        return response_url, combined, combined.startswith(b"ftyp")
-    combined = bytearray(total_size)
-    received = bytearray(total_size)
-    for start, end, _, body in ranges:
-        chunk = body[: min(end, total_size - 1) - start + 1]
-        combined[start : start + len(chunk)] = chunk
-        received[start : start + len(chunk)] = b"\1" * len(chunk)
-    complete = all(received) and bytes(combined).startswith(b"ftyp")
-    if not complete:
-        print("動画のRangeレスポンスまたはMP4先頭が不足しています。保存をスキップします。", file=sys.stderr)
-    return response_url, bytes(combined), complete
-
-
-def wait_for_video_end(page: Page, timeout_ms: int = 120_000) -> None:
-    video = page.locator("video").last
-    if not video.count():
-        page.wait_for_timeout(1500)
-        return
-    try:
-        video.evaluate("element => element.play()")
-        page.wait_for_function(
-            "element => element.ended",
-            arg=video.element_handle(timeout=5000),
-            timeout=timeout_ms,
-        )
-    except Exception:
-        page.wait_for_timeout(1500)
-
-
-def fetch_video_url(page: Page, video_url: str, output_dir: Path, sequence: int) -> Path:
-    response = page.context.request.get(video_url, timeout=120_000, fail_on_status_code=True)
-    body = response.body()
-    print(
-        f"動画URLを直接取得しました: status={response.status}, "
-        f"content-type={response.headers.get('content-type', '')}, bytes={len(body)}"
-    )
-    ftyp_position = body.find(b"ftyp", 0, 32)
-    if ftyp_position < 0:
-        raise RuntimeError("直接取得したレスポンスが完全なMP4ではありません。")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    filename = Path(urlparse(video_url).path).stem or f"video-{sequence}"
-    output_path = output_dir / f"{sequence:03d}-{filename}.mp4"
-    if output_path.exists():
-        output_path = output_dir / f"{output_path.stem}-{sequence}.mp4"
-    output_path.write_bytes(body)
-    print(f"動画データを直接取得しました: {len(body)} bytes")
-    return output_path
-
-
-def download_videos(
-    page: Page,
-    media_list_url: str,
-    output_dir: Path,
-    max_videos: int,
-    click_interval: float,
-) -> None:
-    if max_videos < 1:
-        raise ValueError("--max-videos は1以上で指定してください。")
-    if click_interval < 0.5:
-        raise ValueError("--click-interval は0.5秒以上で指定してください。")
-
-    responses: list[tuple[str, bytes, str]] = []
-
-    def on_response(response) -> None:
-        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if content_type == "video/mp4":
+@dataclass
+class State:
+    root:Path
+    photos:set[str]=field(default_factory=set)
+    thumbs:set[str]=field(default_factory=set)
+    saved_photos:int=0
+    saved_videos:int=0
+    video_full:list[tuple[str,bytes]]=field(default_factory=list)
+    video_parts:list[tuple[int,int,int|None,bytes]]=field(default_factory=list)
+    photo_active:bool=False
+    video_active:bool=False
+    def load(self):
+        self.root.mkdir(parents=True,exist_ok=True)
+        p=self.root/'.processed.json'
+        if p.exists():
             try:
-                body = response.body()
-            except Exception as error:
-                print(f"動画レスポンス本文を取得できませんでした: {response.url} ({error})", file=sys.stderr)
-                return
-            responses.append((response.url, body, response.headers.get("content-range", "")))
+                d=json.loads(p.read_text(encoding='utf-8')); self.photos.update(d.get('photos',[])); self.thumbs.update(d.get('thumbnails',[]))
+            except Exception: pass
+    def save(self):
+        (self.root/'.processed.json').write_text(json.dumps({'photos':sorted(self.photos),'thumbnails':sorted(self.thumbs)},ensure_ascii=False,indent=2),encoding='utf-8')
 
-    def attach_response_listener(target_page: Page) -> None:
-        target_page.on("response", on_response)
-
-    for open_page in page.context.pages:
-        attach_response_listener(open_page)
-    page.context.on("page", attach_response_listener)
-    page.goto(media_list_url, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
-    print(f"メディア一覧を開きました: {page.url}")
-    semantics_placeholder = page.locator("flt-semantics-placeholder")
-    if semantics_placeholder.count():
-        semantics_placeholder.evaluate("element => element.click()")
-        page.wait_for_timeout(500)
-    activate_video_tab(page)
-    item_targets = video_item_targets(page)
-    print("動画タブを開きました。")
-
-    item_count = min(len(item_targets), max_videos)
-    if item_count == 0:
-        raise RuntimeError("動画タブ内にクリック可能な動画項目がありません。")
-    print(f"動画項目を検出しました: {len(item_targets)}件。今回の処理: {item_count}件")
-
-    output_dir = output_dir / "video"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    saved_count = 0
-    for index in range(item_count):
-        if index > 0:
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
-            activate_video_tab(page)
-            item_targets = video_item_targets(page)
-        if index >= len(item_targets):
-            print(f"動画 {index + 1} は現在の画面から取得できないため終了します。")
-            break
-
-        responses_before_click = len(responses)
-        print(f"動画 {index + 1}/{item_count} をクリックします。")
+class Capture:
+    def __init__(self,page:Page,state:State):
+        self.page,self.s=page,state
+        self.current_thumb_keys=set()
+    def start(self):self.page.on('response',self.on_response)
+    def stop(self):
+        try:self.page.remove_listener('response',self.on_response)
+        except Exception:pass
+    def on_response(self,r:Response):
         try:
-            click_video_target(page, item_targets[index])
-        except PlaywrightTimeoutError:
-            print(f"動画 {index + 1} のクリック対象が消えました。プレイヤーを閉じて再取得します。")
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
-            activate_video_tab(page)
-            item_targets = video_item_targets(page)
-            if index >= len(item_targets):
-                break
-            click_video_target(page, item_targets[index])
-        wait_for_video_end(page)
+            if mime(r)=='image/jpeg': self.jpeg(r)
+            elif mime(r)=='video/mp4' and self.s.video_active:self.mp4(r)
+        except Exception as e: print('response error:',e)
+    def jpeg(self,r:Response):
+        key=normalize_url(r.url)
+        if self.s.photo_active and key not in self.s.photos:
+            b=r.body(); p=unique(self.s.root/'photos'/filename(r.url,f'photo_{self.s.saved_photos+1:06}.jpg')); p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(b)
+            self.s.photos.add(key); self.s.saved_photos+=1; self.s.save(); print('[PHOTO]',p)
+        if self.s.video_active:self.current_thumb_keys.add(key)
+    def mp4(self,r:Response):
+        b=r.body(); cr=parse_range(r.headers.get('content-range',''))
+        if cr:self.s.video_parts.append((*cr,b))
+        else:self.s.video_full.append((r.url,b))
 
-        response_url, response_body, complete = combine_video_responses(responses[responses_before_click:]) if responses[responses_before_click:] else ("", b"", False)
-        if response_url and complete:
-            try:
-                filename = Path(urlparse(response_url).path).stem or f"video-{index + 1}"
-                output_path = output_dir / f"{filename}.mp4"
-                if output_path.exists():
-                    output_path = output_dir / f"{output_path.stem}-{saved_count + 1}.mp4"
-                output_path.write_bytes(response_body)
-                saved_count += 1
-                print(f"動画を保存しました ({saved_count}): {output_path}（Rangeレスポンスを{len(responses) - responses_before_click}件取得）")
-            except Exception as error:
-                print(f"動画の保存に失敗しました: {response_url} ({error})", file=sys.stderr)
+def connect(p:Playwright,cdp:str):
+    try:b=p.chromium.connect_over_cdp(cdp,timeout=15000)
+    except PlaywrightTimeoutError as e:raise RuntimeError('Edgeへ接続できません') from e
+    pages=[x for c in b.contexts for x in c.pages]
+    if not pages:raise RuntimeError('Edgeにタブがありません')
+    return b,pages[-1]
 
-            page.keyboard.press("Escape")
-        if index + 1 < item_count:
-            page.wait_for_timeout(round(click_interval * 1000))
+def video_tab(page:Page,index:int):
+    try:
+        x=page.locator('[role="tablist"] [role="button"]')
+        if x.count()>index:x.nth(index).click(timeout=5000);page.wait_for_timeout(800);return
+    except Exception:pass
+    x=page.get_by_text(re.compile('動画'))
+    if x.count():x.last.click(timeout=5000);page.wait_for_timeout(800);return
+    raise RuntimeError('動画タブを見つけられません')
 
-    if saved_count == 0:
-        print("video/mp4 のレスポンスは検出できませんでした。動画項目のクリック結果を確認してください。")
-    else:
-        print(f"動画処理を終了しました。保存件数: {saved_count}")
+def targets(page:Page):
+    out=[]
+    for sel in ('[role="button"]','[role="img"]','img','video'):
+        loc=page.locator(sel)
+        for i in range(loc.count()):
+            try:b=loc.nth(i).bounding_box()
+            except Exception:b=None
+            if not b or b['width']<40 or b['height']<40 or b['y']<80:continue
+            src=loc.nth(i).get_attribute('src') or loc.nth(i).get_attribute('href') or ''
+            key=normalize_url(src) if src else f'{sel}:{round(b["x"])}:{round(b["y"])}:{round(b["width"])}:{round(b["height"])}'
+            out.append((b['y'],b['x'],sel,i,key))
+    out.sort(key=lambda x:(round(x[0]/10),x[1])); seen=set(); ans=[]
+    for y,x,s,i,k in out:
+        g=(round(x),round(y))
+        if g not in seen:seen.add(g);ans.append((s,i,k))
+    return ans
 
+def click(page,s,i):
+    try:page.locator(s).nth(i).scroll_into_view_if_needed(timeout=3000);page.locator(s).nth(i).click(timeout=5000);return True
+    except Exception as e:print('click failed:',e);return False
 
-def verify_videos(page: Page, media_list_url: str, click_interval: float) -> None:
-    if click_interval < 0.5:
-        raise ValueError("--click-interval は0.5秒以上で指定してください。")
+def find_scroll_container(page):
+    """メディア一覧として使われている可能性が高いスクロールコンテナを探す。
+    scrollTop / scrollHeight / clientHeight と画面上の位置を返す。
+    """
+    try:
+        return page.evaluate("""() => {
+            const els = [...document.querySelectorAll('*')];
 
-    page.goto(media_list_url, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
-    print(f"メディア一覧を開きました: {page.url}")
-    semantics_placeholder = page.locator("flt-semantics-placeholder")
-    if semantics_placeholder.count():
-        semantics_placeholder.evaluate("element => element.click()")
-        page.wait_for_timeout(500)
+            const candidates = els
+                .map((el, i) => {
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
 
-    activate_video_tab(page)
-    item_targets = video_item_targets(page)
-    total = len(item_targets)
-    if total == 0:
-        button_count = page.locator('[role="button"]').count()
-        raise RuntimeError(
-            "動画タブ内にクリック可能な動画項目がありません。"
-            f" Semanticsのbutton数: {button_count}。"
-            "動画カードが画面内に表示される位置までスクロールされているか確認してください。"
-        )
-    print(f"動画項目を検出しました: {total}件。保存せず全件を確認します。")
-
-    verified_count = 0
-    for index in range(total):
-        if index > 0:
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
-            activate_video_tab(page)
-            item_targets = video_item_targets(page)
-        if index >= len(item_targets):
-            print(f"動画 {index + 1} は再取得できないため終了します。")
-            break
-        print(f"動画 {index + 1}/{total} をクリックします。")
-        try:
-            click_video_target(page, item_targets[index])
-            page.wait_for_timeout(1500)
-            verified_count += 1
-            print(f"動画 {index + 1}/{total} のクリックを確認しました。")
-        except PlaywrightTimeoutError:
-            print(f"動画 {index + 1}/{total} はクリックできませんでした。", file=sys.stderr)
-        if index + 1 < total:
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(round(click_interval * 1000))
-
-    print(f"動画クリック確認を終了しました。成功: {verified_count}/{total}")
-
-
-def process_visible_videos(
-    page: Page,
-    click_interval: float,
-    save_responses: bool,
-    processed_ids: set[str],
-    output_dir: Path | None = None,
-    max_count: int | None = None,
-) -> int:
-    video_urls: list[str] = []
-    seen_urls: set[str] = set()
-
-    def on_response(response) -> None:
-        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if content_type == "video/mp4" and response.url not in seen_urls:
-            seen_urls.add(response.url)
-            video_urls.append(response.url)
-            print(f"動画URLを検出しました: {response.url}")
-
-    def attach_response_listener(target_page: Page) -> None:
-        target_page.on("response", on_response)
-
-    for open_page in page.context.pages:
-        attach_response_listener(open_page)
-    page.context.on("page", attach_response_listener)
-    processed_count = 0
-    initial_target_count = len(video_item_targets(page))
-    target_count = min(initial_target_count, max_count) if max_count else initial_target_count
-    while processed_count < target_count:
-        targets = video_item_targets(page)
-        target = next(
-            (
-                target
-                for target in targets
-                if (
-                    target_key(page, target) not in processed_ids
-                    and target_key(page, target) is not None
+                    return {
+                        i,
+                        tag: el.tagName,
+                        cls: typeof el.className === 'string' ? el.className : '',
+                        id: el.id || '',
+                        scrollTop: el.scrollTop,
+                        scrollHeight: el.scrollHeight,
+                        clientHeight: el.clientHeight,
+                        overflowY: s.overflowY,
+                        top: r.top,
+                        bottom: r.bottom,
+                        height: r.height,
+                        width: r.width,
+                        x: r.left + r.width / 2,
+                        y: r.top + r.height / 2
+                    };
+                })
+                .filter(x =>
+                    x.width > 200 &&
+                    x.height > 100 &&
+                    x.scrollHeight > x.clientHeight + 20 &&
+                    x.overflowY !== 'visible' &&
+                    x.bottom > 0 &&
+                    x.top < window.innerHeight
                 )
-            ),
-            None,
+                .sort((a, b) => {
+                    // 画面内に大きく表示されているものを優先。
+                    const aVisible =
+                        Math.max(0, Math.min(a.bottom, window.innerHeight) - Math.max(a.top, 0));
+                    const bVisible =
+                        Math.max(0, Math.min(b.bottom, window.innerHeight) - Math.max(b.top, 0));
+
+                    if (bVisible !== aVisible) {
+                        return bVisible - aVisible;
+                    }
+
+                    // 次に実際にスクロールできる量が大きいものを優先。
+                    return (b.scrollHeight - b.clientHeight) -
+                           (a.scrollHeight - a.clientHeight);
+                });
+
+            return candidates;
+        }""")
+    except Exception:
+        return []
+
+
+def scroll_up(page: Page):
+    """メディア一覧のスクロールコンテナを上方向へスクロールする。"""
+
+    containers = find_scroll_container(page)
+
+    if containers:
+        info = containers[0]
+
+        print(
+            f"スクロール対象: "
+            f"{info['tag']} "
+            f"class={info['cls'][:80]} "
+            f"scrollTop={info['scrollTop']} "
+            f"scrollHeight={info['scrollHeight']} "
+            f"clientHeight={info['clientHeight']}"
         )
-        if target is None:
-            break
-        role, index = target
-        locator = page.locator(f'[role="{role}"]').nth(index)
-        target_id = target_key(page, target)
-        if target_id is None:
-            continue
-        if target_id in processed_ids:
-            continue
-        processed_ids.add(target_id)
-        url_count = len(video_urls)
-        print(f"動画をクリックします: {target_id}")
+
+        before = info["scrollTop"]
+
         try:
-            locator.click(timeout=5000)
-            response_waited = 0
-            while save_responses and len(video_urls) == url_count and response_waited < 10_000:
-                page.wait_for_timeout(250)
-                response_waited += 250
-            if save_responses and output_dir:
-                if len(video_urls) > url_count:
-                    try:
-                        print("検出した動画URLの直接取得を開始します。")
-                        output_path = fetch_video_url(page, video_urls[url_count], output_dir, processed_count + 1)
-                        print(f"動画を保存しました: {output_path}（URL直接取得）")
-                    except Exception as error:
-                        print(f"動画の直接取得に失敗しました: {error}", file=sys.stderr)
-                else:
-                    print("video/mp4レスポンスを10秒待ちましたが検出できませんでした。")
-            processed_count += 1
-            print(f"動画の再生を確認しました: {processed_count}件")
-        except PlaywrightTimeoutError:
-            print(f"動画をクリックできませんでした: {target_id}", file=sys.stderr)
-        finally:
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(round(click_interval * 1000))
-    return processed_count
+            page.evaluate(
+                """info => {
+                    const els = [...document.querySelectorAll('*')];
+                    const el = els[info.i];
 
+                    if (el) {
+                        el.scrollTop = Math.max(
+                            0,
+                            el.scrollTop - 1200
+                        );
+                    }
+                }""",
+                info,
+            )
+        except Exception as e:
+            print("スクロール失敗:", e)
 
-def target_key(page: Page, target: tuple[str, int]) -> str | None:
-    role, index = target
-    locator = page.locator(f'[role="{role}"]').nth(index)
-    box = locator.bounding_box()
-    if not box:
-        return None
-    element_id = locator.get_attribute("id")
-    if element_id:
-        return element_id
-    return f"{role}:{round(box['x'])}:{round(box['y'])}:{round(box['width'])}:{round(box['height'])}"
-
-
-def scroll_video_list(
-    page: Page,
-    media_list_url: str,
-    click_interval: float,
-    save: bool,
-    output_dir: Path,
-    max_videos: int,
-) -> None:
-    if max_videos < 1:
-        raise ValueError("--max-videos は1以上で指定してください。")
-    page.goto(media_list_url, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
-    placeholder = page.locator("flt-semantics-placeholder")
-    if placeholder.count():
-        placeholder.evaluate("element => element.click()")
-        page.wait_for_timeout(500)
-    activate_video_tab(page)
-    processed_ids: set[str] = set()
-    total = 0
-    unchanged_rounds = 0
-    for _ in range(100):
-        if total >= max_videos:
-            break
-        before_count = len(processed_ids)
-        total += process_visible_videos(
-            page,
-            click_interval,
-            save,
-            processed_ids,
-            output_dir,
-            max_videos - total,
-        )
-        if len(processed_ids) == before_count:
-            unchanged_rounds += 1
-        else:
-            unchanged_rounds = 0
-        if unchanged_rounds >= 3:
-            break
-        page.mouse.wheel(0, -500)
         page.wait_for_timeout(1000)
-    print(f"動画処理を終了しました。確認件数: {total}")
 
+        containers_after = find_scroll_container(page)
 
-def capture_image(page: Page, selector: str, output_dir: Path, url_filter: str) -> Path:
-    image_response = None
+        if containers_after:
+            after = containers_after[0]["scrollTop"]
+        else:
+            after = before
 
-    def on_response(response) -> None:
-        nonlocal image_response
-        content_type = response.headers.get("content-type", "")
-        if response_matches(response.url, content_type, url_filter):
-            image_response = response
-            print(f"画像レスポンスを検出: {response.status} {response.url}")
-
-    page.on("response", on_response)
-    locator = page.locator(selector).first
-    locator.wait_for(state="visible")
-    print(f"クリック対象: {selector}")
-    locator.click()
-    page.wait_for_timeout(1500)
-
-    if image_response is None:
-        raise RuntimeError(
-            "クリック後に画像レスポンスを検出できませんでした。"
-            " --image-selector または --url-contains を確認してください。"
+        print(
+            f"写真一覧を上へスクロール: "
+            f"{before} -> {after}"
         )
 
-    body = image_response.body()
-    content_type = image_response.headers.get("content-type", "image/jpeg")
-    extension = {
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
-        "image/gif": ".gif",
-    }.get(content_type.split(";", 1)[0], ".bin")
-    output_dir = output_dir / "photo"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    filename = Path(urlparse(image_response.url).path).name or f"captured{extension}"
-    if "." not in filename:
-        filename += extension
-    output_path = output_dir / filename
-    output_path.write_bytes(body)
-    return output_path
+        return before, after
 
+    # スクロールコンテナが見つからなかった場合
+    print("スクロール可能なコンテナが見つかりません。")
 
-def run(args: argparse.Namespace) -> int:
-    if not args.url and not args.cdp_url:
-        raise ValueError("--url または --cdp-url のどちらかが必要です。")
-    if args.cdp_url and args.login:
-        raise ValueError("--cdp-url と --login は同時に指定できません。")
+    before = page.evaluate("window.scrollY")
 
-    for media_type in ("photo", "video", "audio"):
-        (args.output_dir / media_type).mkdir(parents=True, exist_ok=True)
-
-    if args.probe_video:
-        if not args.cdp_url or not args.media_list_url:
-            raise ValueError("--probe-video には --cdp-url と --media-list-url が必要です。")
-        with sync_playwright() as playwright:
-            _, existing_page = connect_to_existing_page(
-                playwright, args.cdp_url, args.page_url_contains
-            )
-            page = existing_page.context.new_page()
-            probe_video_click(
-                page,
-                args.media_list_url,
-                args.video_tab_x,
-                args.video_tab_y,
-                args.video_item_x,
-                args.video_item_y,
-            )
-        return 0
-
-    if args.download_videos:
-        if not args.cdp_url or not args.media_list_url:
-            raise ValueError("--download-videos には --cdp-url と --media-list-url が必要です。")
-        with sync_playwright() as playwright:
-            _, existing_page = connect_to_existing_page(
-                playwright, args.cdp_url, args.page_url_contains
-            )
-            page = existing_page.context.new_page()
-            download_videos(
-                page,
-                args.media_list_url,
-                args.output_dir,
-                args.max_videos,
-                args.click_interval,
-            )
-        return 0
-
-    if args.verify_videos:
-        if not args.cdp_url or not args.media_list_url:
-            raise ValueError("--verify-videos には --cdp-url と --media-list-url が必要です。")
-        with sync_playwright() as playwright:
-            _, existing_page = connect_to_existing_page(
-                playwright, args.cdp_url, args.page_url_contains
-            )
-            page = existing_page.context.new_page()
-            verify_videos(page, args.media_list_url, args.click_interval)
-        return 0
-
-    if args.scroll_videos:
-        if not args.cdp_url or not args.media_list_url:
-            raise ValueError("--scroll-videos には --cdp-url と --media-list-url が必要です。")
-        with sync_playwright() as playwright:
-            _, existing_page = connect_to_existing_page(
-                playwright, args.cdp_url, args.page_url_contains
-            )
-            page = existing_page.context.new_page()
-            scroll_video_list(
-                page,
-                args.media_list_url,
-                args.click_interval,
-                save=args.save_videos,
-                output_dir=args.output_dir / "video",
-                max_videos=args.max_videos,
-            )
-        return 0
-
-    if args.cdp_url:
-        with sync_playwright() as playwright:
-            _, page = connect_to_existing_page(playwright, args.cdp_url, args.page_url_contains)
-            capture_responses(page, args.output_dir, args.url_contains)
-        return 0
-
-    if not args.login and not args.image_selector:
-        raise ValueError("通常取得には --image-selector が必要です。")
-
-    if args.login and args.auth_state.exists():
-        print(f"既存のログイン状態を上書きします: {args.auth_state}")
-
-    with sync_playwright() as playwright:
-        context = launch_context(playwright, None if args.login else args.auth_state)
-        page = context.new_page()
-        page.goto(args.url, wait_until="domcontentloaded")
-
-        if args.login:
-            save_login_state(page, args.auth_state)
-            context.close()
-            return 0
-
-        try:
-            output_path = capture_image(
-                page, args.image_selector, args.output_dir, args.url_contains
-            )
-        finally:
-            context.close()
-
-    print(f"画像を保存しました: {output_path}")
-    return 0
-
-
-def main() -> None:
     try:
-        raise SystemExit(run(build_parser().parse_args()))
-    except KeyboardInterrupt:
-        print("処理を中断しました。", file=sys.stderr)
-        raise SystemExit(130)
+        page.mouse.move(600, 400)
+        page.mouse.wheel(0, -1200)
+        page.wait_for_timeout(1000)
+    except Exception as e:
+        print("マウスホイール失敗:", e)
+
+    after = page.evaluate("window.scrollY")
+
+    print(
+        f"ページ全体をスクロール: "
+        f"{before} -> {after}"
+    )
+
+    return before, after
+
+def media_signature(page):
+    """現在表示されている画像/動画要素のURL群を取得して、
+    スクロールによる新規読み込みを判定する。"""
+    try:
+        return page.evaluate("""() => [...document.querySelectorAll('img, video, source')]
+            .map(x => x.currentSrc || x.src || '')
+            .filter(Boolean).map(x => x.split('?')[0]).sort().join('|')""")
+    except Exception:
+        return ''
+
+def save_video(s:State):
+    d=s.root/'videos';d.mkdir(parents=True,exist_ok=True)
+    if s.video_full:
+        u,b=s.video_full[-1];p=unique(d/filename(u,f'video_{s.saved_videos+1:06}.mp4'));p.write_bytes(b);s.saved_videos+=1;return True
+    parts=sorted(s.video_parts)
+    pos=0;total=None;chunks=[]
+    for st,en,to,b in parts:
+        if st!=pos:return False
+        chunks.append(b);pos=en+1;total=to or total
+    if total is not None and pos!=total:return False
+    if not chunks:return False
+    p=unique(d/f'video_{s.saved_videos+1:06}.mp4');p.write_bytes(b''.join(chunks));s.saved_videos+=1;return True
 
 
-if __name__ == "__main__":
-    main()
+def wait_for_current_media(page, c, seconds=2.0):
+    """現在表示されている一覧の遅延画像が要求され終わるまで待つ。"""
+    deadline = page.evaluate('Date.now()') + int(seconds * 1000)
+    last = c.s.saved_photos
+
+    while page.evaluate('Date.now()') < deadline:
+        page.wait_for_timeout(250)
+
+        if c.s.saved_photos != last:
+            last = c.s.saved_photos
+            deadline = page.evaluate('Date.now()') + int(seconds * 1000)
+
+
+def wait_for_media_list(page, timeout=30.0):
+    """URLが /media-list/ になるまで待つ。"""
+
+    print('メディア一覧への遷移を待っています...')
+
+    deadline = page.evaluate('Date.now()') + int(timeout * 1000)
+
+    while page.evaluate('Date.now()') < deadline:
+        try:
+            url = page.url
+
+            # URLの末尾が /media-list/ になったら一覧ページと判断
+            if url.endswith('/media-list'):
+                print(f'メディア一覧へ遷移しました: {url}')
+                return True
+
+        except Exception:
+            pass
+
+        page.wait_for_timeout(300)
+
+    print(f'{timeout}秒待っても /media-list へ遷移しませんでした。')
+    print(f'現在のURL: {page.url}')
+
+    return False
+
+
+def photo_mode(page,args,c):
+    c.s.photo_active=True
+
+    print('写真一覧が開くのを待っています...')
+
+    # 一覧が実際に表示されるまで待つ
+    if not wait_for_media_list(page, 15.0):
+        print('写真一覧を確認できないため終了します。')
+        return
+
+    print('写真一覧が開きました。ここから処理を開始します。')
+
+    print(f"現在URL: {page.url}")
+    print(f"ページタイトル: {page.title()}")
+
+    try:
+        print("imgタグ数:", page.locator("img").count())
+    except Exception as e:
+        print("img取得エラー:", e)
+    # 現在表示されている分の遅延読み込みを待つ
+    wait_for_current_media(page, c, 2.0)
+
+    print(f'現在表示分のJPEG保存完了: {c.s.saved_photos}件')
+
+    no_new_scrolls = 0
+    last_sig = media_signature(page)
+
+    while c.s.saved_photos < args.max_items:
+        before_saved = c.s.saved_photos
+        before, after = scroll_up(page)
+        print(f'写真一覧を上へスクロール: {before} -> {after}')
+
+        # スクロールによる遅延読み込みが終わり、新しいJPEGレスポンスが返るまで待つ。
+        wait_for_current_media(page, c, max(1.0, args.scroll_pause))
+        after_saved = c.s.saved_photos
+        new_sig = media_signature(page)
+
+        if after_saved > before_saved:
+            no_new_scrolls = 0
+            print(f'新規JPEGを保存: +{after_saved-before_saved}件 / 累計 {after_saved}件')
+        else:
+            no_new_scrolls += 1
+            print(f'新規JPEGなし: {no_new_scrolls}/{args.max_no_change}回')
+
+        # スクロール先が変わらず、かつ新しいJPEGも来ない場合も終了候補。
+        if before == after and new_sig == last_sig:
+            no_new_scrolls = max(no_new_scrolls, 1)
+        last_sig = new_sig
+
+        if no_new_scrolls >= args.max_no_change:
+            print(f'上方向へ{args.max_no_change}回スクロールしても新規JPEGがないため終了します。')
+            break
+
+    print('写真終了:',c.s.saved_photos)
+
+def video_mode(page,args,c):
+    video_tab(page,args.video_tab_index)
+    c.s.video_active=True
+
+    print('動画一覧が開くのを待っています...')
+
+    # 動画タブを開いた後、実際に一覧が表示されるまで待つ
+    if not wait_for_media_list(page, 15.0):
+        print('動画一覧を確認できないため終了します。')
+        return
+
+    print('動画一覧が開きました。ここから処理を開始します。')
+
+    opened=set()
+    no_new_scrolls=0
+    last_sig=media_signature(page)
+
+    # 現在見えている動画を先に処理する。
+    while len(opened) < args.max_items:
+        ts=targets(page)
+        new=[x for x in ts if x[2] not in opened and x[2] not in c.s.thumbs]
+        if not new:
+            break
+        for sel,i,key in new:
+            opened.add(key)
+            c.s.thumbs.add(key)
+            c.s.save()
+            c.s.video_full.clear(); c.s.video_parts.clear()
+            if click(page,sel,i):
+                page.wait_for_timeout(int(args.video_wait*1000))
+                if save_video(c.s):
+                    print('[VIDEO] saved',c.s.saved_videos)
+                else:
+                    print('[VIDEO] complete MP4 not captured')
+                try: page.keyboard.press('Escape')
+                except Exception: pass
+                page.wait_for_timeout(int(args.click_interval*1000))
+
+    # 現在分を処理し終えたら上へスクロールし、新しいJPEGサムネイルが要求されたら続ける。
+    while len(opened) < args.max_items:
+        before_count=len(opened)
+        before, after=scroll_up(page)
+        print(f'動画一覧を上へスクロール: {before} -> {after}')
+        page.wait_for_timeout(int(max(1.0,args.scroll_pause)*1000))
+
+        ts=targets(page)
+        new=[x for x in ts if x[2] not in opened and x[2] not in c.s.thumbs]
+        new_sig=media_signature(page)
+
+        if new:
+            no_new_scrolls=0
+            print(f'新規動画サムネイル: {len(new)}件')
+            for sel,i,key in new:
+                opened.add(key)
+                c.s.thumbs.add(key)
+                c.s.save()
+                c.s.video_full.clear(); c.s.video_parts.clear()
+                if click(page,sel,i):
+                    page.wait_for_timeout(int(args.video_wait*1000))
+                    if save_video(c.s): print('[VIDEO] saved',c.s.saved_videos)
+                    else: print('[VIDEO] complete MP4 not captured')
+                    try: page.keyboard.press('Escape')
+                    except Exception: pass
+                    page.wait_for_timeout(int(args.click_interval*1000))
+        else:
+            no_new_scrolls += 1
+            print(f'新規動画サムネイルなし: {no_new_scrolls}/{args.max_no_change}回')
+
+        if before==after and new_sig==last_sig:
+            no_new_scrolls=max(no_new_scrolls,1)
+        last_sig=new_sig
+        if no_new_scrolls>=args.max_no_change:
+            print(f'上方向へ{args.max_no_change}回スクロールしても新規動画がないため終了します。')
+            break
+
+    print('動画終了:',c.s.saved_videos)
+
+def main():
+    ap=argparse.ArgumentParser();ap.add_argument('--cdp-url',required=True);ap.add_argument('--media-list-url',required=True);ap.add_argument('--mode',choices=['photo','video'],required=True);ap.add_argument('--output-dir',default='output');ap.add_argument('--max-items',type=int,default=100000);ap.add_argument('--scroll-pause',type=float,default=1);ap.add_argument('--click-interval',type=float,default=1);ap.add_argument('--max-no-change',type=int,default=4);ap.add_argument('--video-tab-index',type=int,default=1);ap.add_argument('--video-wait',type=float,default=8);ap.add_argument('--skip-navigation',action='store_true');args=ap.parse_args()
+    s=State(Path(args.output_dir));s.load()
+    with sync_playwright() as pw:
+        b,page=connect(pw,args.cdp_url);c=Capture(page,s);c.start()
+        try:
+            if not args.skip_navigation:
+                page.goto(args.media_list_url, wait_until='domcontentloaded')
+                page.wait_for_timeout(1500)
+            else:
+                print(f'現在のEdge URL: {page.url}')
+
+            if args.mode == 'photo':
+                photo_mode(page, args, c)
+            else:
+                video_mode(page, args, c)
+        finally:c.stop()
+    print(f'完了 写真={s.saved_photos} 動画={s.saved_videos}')
+if __name__=='__main__':main()

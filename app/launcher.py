@@ -9,6 +9,7 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from playwright.sync_api import sync_playwright
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -33,13 +34,15 @@ class Launcher(tk.Tk):
         super().__init__()
         self.title("画像保存ツール")
         self.geometry("680x720")
-        self.selected_members: dict[int, tk.BooleanVar] = {}
-        self.media_photo = tk.BooleanVar(value=False)
-        self.media_video = tk.BooleanVar(value=True)
+        self.selected_member_id = tk.IntVar(value=0)
+        self.media_photo = tk.BooleanVar(value=True)
+        self.media_video = tk.BooleanVar(value=False)
         self.media_audio = tk.BooleanVar(value=False)
         self.output_dir = tk.StringVar(value=str(PROJECT_ROOT / "output"))
         self.status = tk.StringVar(value="専用Edgeを起動してください。")
         self.process: subprocess.Popen[str] | None = None
+        self.running = False
+        self.start_button: ttk.Button | None = None
         self.members = self.load_members()
         self.build_ui()
         self.after(200, self.launch_edge)
@@ -73,23 +76,28 @@ class Launcher(tk.Tk):
         for generation, members in generations.items():
             ttk.Label(content, text=f"{generation}期生", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 2))
             for member in members:
-                variable = tk.BooleanVar(value=False)
                 talk_id = int(member["talk_id"])
-                self.selected_members[talk_id] = variable
-                ttk.Checkbutton(content, text=str(member["name"]), variable=variable).pack(anchor="w")
+
+                ttk.Radiobutton(
+                    content,
+                    text=str(member["name"]),
+                    variable=self.selected_member_id,
+                    value=talk_id,
+                ).pack(anchor="w")
 
         media_frame = ttk.LabelFrame(root, text="取得する種類")
         media_frame.pack(fill="x", pady=12)
         ttk.Checkbutton(media_frame, text="写真", variable=self.media_photo).pack(side="left", padx=8)
-        ttk.Checkbutton(media_frame, text="動画", variable=self.media_video).pack(side="left", padx=8)
-        ttk.Checkbutton(media_frame, text="音声（準備中）", variable=self.media_audio).pack(side="left", padx=8)
+        ttk.Checkbutton(media_frame, text="動画(準備中)", variable=self.media_video, state="disabled").pack(side="left", padx=8)
+        ttk.Checkbutton(media_frame, text="音声（準備中）", variable=self.media_audio, state="disabled").pack(side="left", padx=8)
 
         output_frame = ttk.Frame(root)
         output_frame.pack(fill="x")
         ttk.Label(output_frame, text="保存先").pack(side="left")
         ttk.Entry(output_frame, textvariable=self.output_dir).pack(side="left", fill="x", expand=True, padx=8)
         ttk.Button(output_frame, text="参照", command=self.choose_output).pack(side="right")
-        ttk.Button(root, text="選択した内容で取得開始", command=self.start).pack(fill="x", pady=(12, 4))
+        self.start_button = ttk.Button(root, text="選択した内容で取得開始", command=self.start)
+        self.start_button.pack(fill="x", pady=(12, 4))
         ttk.Label(root, textvariable=self.status, foreground="#555").pack(anchor="w")
 
     def launch_edge(self) -> None:
@@ -102,13 +110,55 @@ class Launcher(tk.Tk):
         except Exception as error:
             messagebox.showerror("Edgeを起動できません", str(error))
 
+    def navigate_edge(self, url: str) -> None:
+        """専用Edgeを指定したURLへ移動する。"""
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(
+                CDP_URL,
+                timeout=15000,
+            )
+
+            pages = [
+                page
+                for context in browser.contexts
+                for page in context.pages
+            ]
+
+            if not pages:
+                raise RuntimeError("Edgeにタブがありません。")
+
+            page = pages[-1]
+
+            print(f"Edgeをメディア一覧へ移動します: {url}")
+
+            page.goto(
+                url,
+                wait_until="domcontentloaded",
+            )
+
+            page.wait_for_timeout(1000)
+
+            print(f"Edge現在URL: {page.url}")
+
     def choose_output(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.output_dir.get())
         if selected:
             self.output_dir.set(selected)
 
     def start(self) -> None:
-        selected_ids = [talk_id for talk_id, variable in self.selected_members.items() if variable.get()]
+        if self.running:
+            messagebox.showinfo("実行中", "すでに取得処理を実行しています。")
+            return
+        selected_id = self.selected_member_id.get()
+
+        if selected_id == 0:
+            messagebox.showwarning(
+                "メンバー未選択",
+                "メンバーを1人選択してください。",
+            )
+            return
+
+        selected_ids = [selected_id]
         if not selected_ids:
             messagebox.showwarning("メンバー未選択", "メンバーを1人以上選択してください。")
             return
@@ -117,24 +167,112 @@ class Launcher(tk.Tk):
             return
         if self.media_audio.get():
             messagebox.showinfo("取得種類", "音声処理は準備中です。写真・動画のみ実行します。")
-        self.status.set("取得中です。PowerShellとEdgeを閉じないでください。")
-        threading.Thread(target=self.run_jobs, args=(selected_ids,), daemon=True).start()
+        photo_selected = self.media_photo.get()
+        video_selected = self.media_video.get()
+        output_dir = self.output_dir.get()
+                # 最初に選択されたメンバーのメディア一覧へEdgeを移動
+        first_talk_id = selected_ids[0]
+        first_url = (
+            f"https://message.sakurazaka46.com/"
+            f"organization/1/talk/timeline/{first_talk_id}/media-list"
+        )
 
-    def run_jobs(self, talk_ids: list[int]) -> None:
-        output_dir = Path(self.output_dir.get())
+        try:
+            self.status.set("Edgeをメディア一覧へ移動しています。")
+            self.navigate_edge(first_url)
+        except Exception as error:
+            messagebox.showerror(
+                "Edge遷移エラー",
+                str(error),
+            )
+            return
+
+        self.running = True
+
+        if self.start_button:
+            self.start_button.configure(state="disabled")
+
+        self.status.set(
+            "メディア一覧へ移動しました。取得処理を開始します。"
+        )
+
+        threading.Thread(
+            target=self.run_jobs,
+            args=(
+                selected_ids,
+                photo_selected,
+                video_selected,
+                output_dir,
+            ),
+            daemon=True,
+        ).start()
+
+    def run_jobs(
+        self, talk_ids: list[int], photo_selected: bool, video_selected: bool, output_dir_value: str
+    ) -> None:
+        output_dir = Path(output_dir_value)
         if output_dir.name.lower() in {"photo", "video", "audio"}:
             output_dir = output_dir.parent
-        for talk_id in talk_ids:
-            url = f"https://message.sakurazaka46.com/organization/1/talk/timeline/{talk_id}/media-list"
-            python = str(Path(__file__).resolve().parent.parent / ".venv/Scripts/python.exe")
-            common = [python, "-m", "app.phase1", "--cdp-url", CDP_URL, "--media-list-url", url, "--output-dir", str(output_dir)]
-            if self.media_photo.get():
-                self.process = subprocess.Popen(common + ["--scroll-photos", "--max-photos", "999999"], cwd=PROJECT_ROOT, text=True)
-                self.process.wait()
-            if self.media_video.get():
-                self.process = subprocess.Popen(common + ["--scroll-videos", "--save-videos", "--max-videos", "999999", "--click-interval", "1.0"], cwd=PROJECT_ROOT, text=True)
-                self.process.wait()
-        self.after(0, lambda: self.status.set("取得処理が終了しました。"))
+        try:
+            for talk_id in talk_ids:
+                url = f"https://message.sakurazaka46.com/organization/1/talk/timeline/{talk_id}/media-list"
+                python_path = Path(__file__).resolve().parent.parent / ".venv/Scripts/python.exe"
+                python = str(python_path) if python_path.exists() else "python"
+                common = [
+                    python,
+                    "-m",
+                    "app.phase1",
+                    "--cdp-url",
+                    CDP_URL,
+                    "--media-list-url",
+                    url,
+                    "--output-dir",
+                    str(output_dir),
+                    "--skip-navigation",
+                ]
+                # Read the Tk variables once on the UI thread before entering
+                # this worker in normal use; keep the existing UI choices.
+                if photo_selected:
+                    self.process = subprocess.Popen(
+                        common + [
+                            "--mode", "photo",
+                            "--max-items", "999999",
+                            "--max-no-change", "3",
+                            "--scroll-pause", "1",
+                        ],
+                        cwd=PROJECT_ROOT,
+                        text=True,
+                    )
+                    return_code = self.process.wait()
+                    if return_code != 0:
+                        raise RuntimeError(f"写真処理が終了コード {return_code} で終了しました。")
+                if video_selected:
+                    self.process = subprocess.Popen(
+                        common + [
+                            "--mode", "video",
+                            "--max-items", "999999",
+                            "--max-no-change", "3",
+                            "--scroll-pause", "1",
+                            "--click-interval", "1.0",
+                            "--video-wait", "8",
+                        ],
+                        cwd=PROJECT_ROOT,
+                        text=True,
+                    )
+                    return_code = self.process.wait()
+                    if return_code != 0:
+                        raise RuntimeError(f"動画処理が終了コード {return_code} で終了しました。")
+            self.after(0, lambda: self.status.set("取得処理が終了しました。"))
+        except Exception as error:
+            self.after(0, lambda: messagebox.showerror("取得処理エラー", str(error)))
+            self.after(0, lambda: self.status.set("取得処理がエラーで終了しました。"))
+        finally:
+            self.running = False
+            self.after(0, self._enable_start)
+
+    def _enable_start(self) -> None:
+        if self.start_button:
+            self.start_button.configure(state="normal")
 
 
 def main() -> None:
