@@ -1,0 +1,145 @@
+"""Desktop launcher for the authenticated media collector."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MEMBERS_FILE = PROJECT_ROOT / "data" / "members.json"
+SITE_URL = "https://message.sakurazaka46.com"
+CDP_URL = "http://127.0.0.1:9222"
+
+
+def find_edge() -> Path:
+    candidates = [
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "Microsoft/Edge/Application/msedge.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Microsoft/Edge/Application/msedge.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError("Microsoft Edge が見つかりません。")
+
+
+class Launcher(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("画像保存ツール")
+        self.geometry("680x720")
+        self.selected_members: dict[int, tk.BooleanVar] = {}
+        self.media_photo = tk.BooleanVar(value=False)
+        self.media_video = tk.BooleanVar(value=True)
+        self.media_audio = tk.BooleanVar(value=False)
+        self.output_dir = tk.StringVar(value=str(PROJECT_ROOT / "output"))
+        self.status = tk.StringVar(value="専用Edgeを起動してください。")
+        self.process: subprocess.Popen[str] | None = None
+        self.members = self.load_members()
+        self.build_ui()
+        self.after(200, self.launch_edge)
+
+    @staticmethod
+    def load_members() -> list[dict[str, object]]:
+        with MEMBERS_FILE.open(encoding="utf-8") as file:
+            return json.load(file)["members"]
+
+    def build_ui(self) -> None:
+        root = ttk.Frame(self, padding=16)
+        root.pack(fill="both", expand=True)
+        ttk.Label(root, text="画像保存ツール", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        ttk.Label(root, text="Edgeでログイン後、メンバーと種類を選択して取得を開始します。").pack(anchor="w", pady=(4, 12))
+
+        member_frame = ttk.LabelFrame(root, text="メンバー")
+        member_frame.pack(fill="both", expand=True)
+        canvas = tk.Canvas(member_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(member_frame, orient="vertical", command=canvas.yview)
+        content = ttk.Frame(canvas)
+        content.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        generations: dict[int, list[dict[str, object]]] = {}
+        for member in self.members:
+            generation = int(member["generation"])
+            generations.setdefault(generation, []).append(member)
+        for generation, members in generations.items():
+            ttk.Label(content, text=f"{generation}期生", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 2))
+            for member in members:
+                variable = tk.BooleanVar(value=False)
+                talk_id = int(member["talk_id"])
+                self.selected_members[talk_id] = variable
+                ttk.Checkbutton(content, text=str(member["name"]), variable=variable).pack(anchor="w")
+
+        media_frame = ttk.LabelFrame(root, text="取得する種類")
+        media_frame.pack(fill="x", pady=12)
+        ttk.Checkbutton(media_frame, text="写真", variable=self.media_photo).pack(side="left", padx=8)
+        ttk.Checkbutton(media_frame, text="動画", variable=self.media_video).pack(side="left", padx=8)
+        ttk.Checkbutton(media_frame, text="音声（準備中）", variable=self.media_audio).pack(side="left", padx=8)
+
+        output_frame = ttk.Frame(root)
+        output_frame.pack(fill="x")
+        ttk.Label(output_frame, text="保存先").pack(side="left")
+        ttk.Entry(output_frame, textvariable=self.output_dir).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(output_frame, text="参照", command=self.choose_output).pack(side="right")
+        ttk.Button(root, text="選択した内容で取得開始", command=self.start).pack(fill="x", pady=(12, 4))
+        ttk.Label(root, textvariable=self.status, foreground="#555").pack(anchor="w")
+
+    def launch_edge(self) -> None:
+        try:
+            edge = find_edge()
+            profile = PROJECT_ROOT / ".data" / "edge-profile"
+            profile.mkdir(parents=True, exist_ok=True)
+            subprocess.Popen([str(edge), "--remote-debugging-port=9222", f"--user-data-dir={profile}", SITE_URL])
+            self.status.set("専用Edgeとサイトを起動しました。Edgeでログインしてください。")
+        except Exception as error:
+            messagebox.showerror("Edgeを起動できません", str(error))
+
+    def choose_output(self) -> None:
+        selected = filedialog.askdirectory(initialdir=self.output_dir.get())
+        if selected:
+            self.output_dir.set(selected)
+
+    def start(self) -> None:
+        selected_ids = [talk_id for talk_id, variable in self.selected_members.items() if variable.get()]
+        if not selected_ids:
+            messagebox.showwarning("メンバー未選択", "メンバーを1人以上選択してください。")
+            return
+        if not self.media_video.get() and not self.media_photo.get():
+            messagebox.showwarning("取得種類", "写真または動画を選択してください。")
+            return
+        if self.media_audio.get():
+            messagebox.showinfo("取得種類", "音声処理は準備中です。写真・動画のみ実行します。")
+        self.status.set("取得中です。PowerShellとEdgeを閉じないでください。")
+        threading.Thread(target=self.run_jobs, args=(selected_ids,), daemon=True).start()
+
+    def run_jobs(self, talk_ids: list[int]) -> None:
+        output_dir = Path(self.output_dir.get())
+        if output_dir.name.lower() in {"photo", "video", "audio"}:
+            output_dir = output_dir.parent
+        for talk_id in talk_ids:
+            url = f"https://message.sakurazaka46.com/organization/1/talk/timeline/{talk_id}/media-list"
+            python = str(Path(__file__).resolve().parent.parent / ".venv/Scripts/python.exe")
+            common = [python, "-m", "app.phase1", "--cdp-url", CDP_URL, "--media-list-url", url, "--output-dir", str(output_dir)]
+            if self.media_photo.get():
+                self.process = subprocess.Popen(common + ["--scroll-photos", "--max-photos", "999999"], cwd=PROJECT_ROOT, text=True)
+                self.process.wait()
+            if self.media_video.get():
+                self.process = subprocess.Popen(common + ["--scroll-videos", "--save-videos", "--max-videos", "999999", "--click-interval", "1.0"], cwd=PROJECT_ROOT, text=True)
+                self.process.wait()
+        self.after(0, lambda: self.status.set("取得処理が終了しました。"))
+
+
+def main() -> None:
+    Launcher().mainloop()
+
+
+if __name__ == "__main__":
+    main()
