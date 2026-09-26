@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse, json, re, signal
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from playwright.sync_api import Page, Playwright, Response, TimeoutError as PlaywrightTimeoutError, sync_playwright
@@ -16,6 +17,17 @@ def mime(r:Response)->str:return (r.headers.get("content-type") or "").split(";"
 def filename(url:str,fallback:str)->str:
     n=Path(urlsplit(url).path).name or fallback
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',n)
+
+def photo_output_path(root:Path,url:str,fallback:str)->Path:
+    name=filename(url,fallback)
+    match=re.fullmatch(r'\d+-(\d{8})-\d+\.jpe?g',name,re.I)
+    if match:
+        try:
+            date=datetime.strptime(match[1],'%Y%m%d')
+            return root/'photo'/f'{date.year}年'/f'{date.month}月'/name
+        except ValueError:
+            pass
+    return root/'photo'/name
 
 def unique(p:Path)->Path:
     if not p.exists(): return p
@@ -59,16 +71,35 @@ class Capture:
         try:self.page.remove_listener('response',self.on_response)
         except Exception:pass
     def on_response(self,r:Response):
+        print("response",mime(r),r.url[:100])
         try:
             if mime(r)=='image/jpeg': self.jpeg(r)
             elif mime(r)=='video/mp4' and self.s.video_active:self.mp4(r)
         except Exception as e: print('response error:',e)
     def jpeg(self,r:Response):
         key=normalize_url(r.url)
-        if self.s.photo_active and key not in self.s.photos:
-            b=r.body(); p=unique(self.s.root/'photos'/filename(r.url,f'photo_{self.s.saved_photos+1:06}.jpg')); p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(b)
-            self.s.photos.add(key); self.s.saved_photos+=1; self.s.save(); print('[PHOTO]',p)
-        if self.s.video_active:self.current_thumb_keys.add(key)
+        photo_path=photo_output_path(self.s.root,r.url,f'photo_{self.s.saved_photos+1:06}.jpg')
+        already=key in self.s.photos and photo_path.is_file()
+
+        print("CURRENT KEY =", repr(key))
+        print("photo_active =", self.s.photo_active)
+        print("already =", already)
+
+        if self.s.photo_active and not already:
+            print("保存処理へ")
+
+            b=r.body()
+
+            p=unique(photo_path)
+
+            p.parent.mkdir(parents=True,exist_ok=True)
+            p.write_bytes(b)
+
+            self.s.photos.add(key)
+            self.s.saved_photos+=1
+            self.s.save()
+
+            print('[PHOTO]',p)
     def mp4(self,r:Response):
         b=r.body(); cr=parse_range(r.headers.get('content-range',''))
         if cr:self.s.video_parts.append((*cr,b))
@@ -447,10 +478,38 @@ def video_mode(page,args,c):
     print('動画終了:',c.s.saved_videos)
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('--cdp-url',required=True);ap.add_argument('--media-list-url',required=True);ap.add_argument('--mode',choices=['photo','video'],required=True);ap.add_argument('--output-dir',default='output');ap.add_argument('--max-items',type=int,default=100000);ap.add_argument('--scroll-pause',type=float,default=1);ap.add_argument('--click-interval',type=float,default=1);ap.add_argument('--max-no-change',type=int,default=4);ap.add_argument('--video-tab-index',type=int,default=1);ap.add_argument('--video-wait',type=float,default=8);ap.add_argument('--skip-navigation',action='store_true');args=ap.parse_args()
-    s=State(Path(args.output_dir));s.load()
+    ap=argparse.ArgumentParser()
+    ap.add_argument('--cdp-url',required=True)
+    ap.add_argument('--media-list-url',required=True)
+    ap.add_argument('--mode',choices=['photo','video'],required=True)
+    ap.add_argument('--output-dir',default='output')
+    ap.add_argument('--max-items',type=int,default=100000)
+    ap.add_argument('--scroll-pause',type=float,default=1)
+    ap.add_argument('--click-interval',type=float,default=1)
+    ap.add_argument('--max-no-change',type=int,default=4)
+    ap.add_argument('--video-tab-index',type=int,default=1)
+    ap.add_argument('--video-wait',type=float,default=8)
+    ap.add_argument('--skip-navigation',action='store_true')
+    args=ap.parse_args()
+
+    s=State(Path(args.output_dir))
+    s.load()
+
+    print("=" * 80)
+    print("processed file =", s.root / '.processed.json')
+    print("photos count =", len(s.photos))
+    print("thumbs count =", len(s.thumbs))
+
+    for x in list(s.photos)[:10]:
+        print("PHOTO KEY =", repr(x))
+
+    print("=" * 80)
+
     with sync_playwright() as pw:
-        b,page=connect(pw,args.cdp_url);c=Capture(page,s);c.start()
+        b,page=connect(pw,args.cdp_url)
+        c=Capture(page,s)
+        c.start()
+
         try:
             if not args.skip_navigation:
                 page.goto(args.media_list_url, wait_until='domcontentloaded')
@@ -459,9 +518,12 @@ def main():
                 print(f'現在のEdge URL: {page.url}')
 
             if args.mode == 'photo':
-                photo_mode(page, args, c)
+                photo_mode(page,args,c)
             else:
-                video_mode(page, args, c)
-        finally:c.stop()
+                video_mode(page,args,c)
+
+        finally:
+            c.stop()
+
     print(f'完了 写真={s.saved_photos} 動画={s.saved_videos}')
 if __name__=='__main__':main()
