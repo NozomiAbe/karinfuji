@@ -18,34 +18,99 @@ SITE_URL = "https://message.sakurazaka46.com"
 CDP_URL = "http://127.0.0.1:9222"
 
 
-def find_edge() -> Path:
-    candidates = [
-        Path(os.environ.get("ProgramFiles(x86)", "")) / "Microsoft/Edge/Application/msedge.exe",
-        Path(os.environ.get("ProgramFiles", "")) / "Microsoft/Edge/Application/msedge.exe",
-    ]
-    for candidate in candidates:
+def find_browser(browser_name: str) -> Path:
+    browsers = {
+        "Edge": [
+            Path(os.environ.get("ProgramFiles(x86)", ""))
+            / "Microsoft/Edge/Application/msedge.exe",
+            Path(os.environ.get("ProgramFiles", ""))
+            / "Microsoft/Edge/Application/msedge.exe",
+        ],
+        "Chrome": [
+            Path(os.environ.get("ProgramFiles", ""))
+            / "Google/Chrome/Application/chrome.exe",
+
+            Path(os.environ.get("ProgramFiles(x86)", ""))
+            / "Google/Chrome/Application/chrome.exe",
+
+            Path(os.environ.get("LOCALAPPDATA", ""))
+            / "Google/Chrome/Application/chrome.exe",
+        ],
+    }
+
+    for candidate in browsers.get(browser_name, []):
         if candidate.exists():
             return candidate
-    raise FileNotFoundError("Microsoft Edge が見つかりません。")
+
+    raise FileNotFoundError(f"{browser_name} が見つかりません。")
 
 
 class Launcher(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+
         self.title("画像保存ツール")
         self.geometry("680x720")
+
+        self.selected_browser = tk.StringVar(value="Edge")
+
         self.selected_member_id = tk.IntVar(value=0)
+
         self.media_photo = tk.BooleanVar(value=True)
         self.media_video = tk.BooleanVar(value=False)
         self.media_audio = tk.BooleanVar(value=False)
-        self.output_dir = tk.StringVar(value=str(PROJECT_ROOT / "output"))
-        self.status = tk.StringVar(value="専用Edgeを起動してください。")
+
+        self.output_dir = tk.StringVar(
+            value=str(PROJECT_ROOT / "output")
+        )
+
+        self.status = tk.StringVar(
+            value="ブラウザを起動してください。"
+        )
+
         self.process: subprocess.Popen[str] | None = None
         self.running = False
         self.start_button: ttk.Button | None = None
+
         self.members = self.load_members()
+
         self.build_ui()
-        self.after(200, self.launch_edge)
+
+    def launch_browser(self) -> None:
+        browser_name = self.selected_browser.get()
+
+        try:
+            browser_path = find_browser(browser_name)
+
+            profile = (
+                PROJECT_ROOT
+                / ".data"
+                / f"{browser_name.lower()}-profile"
+            )
+
+            profile.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            subprocess.Popen(
+                [
+                    str(browser_path),
+                    "--remote-debugging-port=9222",
+                    f"--user-data-dir={profile}",
+                    SITE_URL,
+                ]
+            )
+
+            self.status.set(
+                f"{browser_name}を起動しました。ログインしてください。"
+            )
+
+        except Exception as error:
+            messagebox.showerror(
+                f"{browser_name}を起動できません",
+                str(error),
+            )
 
     @staticmethod
     def load_members() -> list[dict[str, object]]:
@@ -56,8 +121,24 @@ class Launcher(tk.Tk):
         root = ttk.Frame(self, padding=16)
         root.pack(fill="both", expand=True)
         ttk.Label(root, text="画像保存ツール", font=("Segoe UI", 18, "bold")).pack(anchor="w")
-        ttk.Label(root, text="Edgeでログイン後、メンバーと種類を選択して取得を開始します。").pack(anchor="w", pady=(4, 12))
+        ttk.Label(root, text="選択したブラウザでログイン後、メンバーと種類を選択して取得を開始します。").pack(anchor="w", pady=(4, 12))
 
+        browser_frame = ttk.LabelFrame(root, text="ブラウザ")
+        browser_frame.pack(fill="x", pady=(0, 12))
+
+        ttk.Combobox(
+            browser_frame,
+            textvariable=self.selected_browser,
+            values=["Edge", "Chrome"],
+            state="readonly",
+            width=15,
+        ).pack(side="left", padx=8, pady=8)
+
+        ttk.Button(
+            browser_frame,
+            text="ブラウザ起動",
+            command=self.launch_browser,
+        ).pack(side="left", padx=8)
         member_frame = ttk.LabelFrame(root, text="メンバー")
         member_frame.pack(fill="both", expand=True)
         canvas = tk.Canvas(member_frame, highlightthickness=0)
@@ -100,18 +181,10 @@ class Launcher(tk.Tk):
         self.start_button.pack(fill="x", pady=(12, 4))
         ttk.Label(root, textvariable=self.status, foreground="#555").pack(anchor="w")
 
-    def launch_edge(self) -> None:
-        try:
-            edge = find_edge()
-            profile = PROJECT_ROOT / ".data" / "edge-profile"
-            profile.mkdir(parents=True, exist_ok=True)
-            subprocess.Popen([str(edge), "--remote-debugging-port=9222", f"--user-data-dir={profile}", SITE_URL])
-            self.status.set("専用Edgeとサイトを起動しました。Edgeでログインしてください。")
-        except Exception as error:
-            messagebox.showerror("Edgeを起動できません", str(error))
 
-    def navigate_edge(self, url: str) -> None:
-        """専用Edgeを指定したURLへ移動する。"""
+    def navigate_browser(self, url: str) -> None:
+        """起動中のブラウザを指定したURLへ移動する。"""
+
         with sync_playwright() as pw:
             browser = pw.chromium.connect_over_cdp(
                 CDP_URL,
@@ -125,11 +198,11 @@ class Launcher(tk.Tk):
             ]
 
             if not pages:
-                raise RuntimeError("Edgeにタブがありません。")
+                raise RuntimeError("ブラウザにタブがありません。")
 
             page = pages[-1]
 
-            print(f"Edgeをメディア一覧へ移動します: {url}")
+            print(f"ブラウザをメディア一覧へ移動します: {url}")
 
             page.goto(
                 url,
@@ -138,7 +211,7 @@ class Launcher(tk.Tk):
 
             page.wait_for_timeout(1000)
 
-            print(f"Edge現在URL: {page.url}")
+            print(f"現在URL: {page.url}")
 
     def choose_output(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.output_dir.get())
@@ -178,11 +251,11 @@ class Launcher(tk.Tk):
         )
 
         try:
-            self.status.set("Edgeをメディア一覧へ移動しています。")
-            self.navigate_edge(first_url)
+            self.status.set("ブラウザをメディア一覧へ移動しています。")
+            self.navigate_browser(first_url)
         except Exception as error:
             messagebox.showerror(
-                "Edge遷移エラー",
+                "ブラウザ遷移エラー",
                 str(error),
             )
             return
@@ -273,6 +346,7 @@ class Launcher(tk.Tk):
     def _enable_start(self) -> None:
         if self.start_button:
             self.start_button.configure(state="normal")
+
 
 
 def main() -> None:
