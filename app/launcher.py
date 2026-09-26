@@ -212,6 +212,10 @@ class Launcher(tk.Tk):
             page.wait_for_timeout(1000)
 
             print(f"現在URL: {page.url}")
+            print("タブ数:", len(pages))
+
+            for i, p in enumerate(pages):
+                print(i, p.url)
 
     def choose_output(self) -> None:
         selected = filedialog.askdirectory(initialdir=self.output_dir.get())

@@ -326,6 +326,11 @@ def photo_mode(page,args,c):
 
     try:
         print("imgタグ数:", page.locator("img").count())
+        print(
+        page.evaluate("""
+        () => document.body.innerText.substring(0,1000)
+        """)
+    )
     except Exception as e:
         print("img取得エラー:", e)
     # 現在表示されている分の遅延読み込みを待つ
