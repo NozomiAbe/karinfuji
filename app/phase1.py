@@ -71,7 +71,6 @@ class Capture:
         try:self.page.remove_listener('response',self.on_response)
         except Exception:pass
     def on_response(self,r:Response):
-        print("response",mime(r),r.url[:100])
         try:
             if mime(r)=='image/jpeg': self.jpeg(r)
             elif mime(r)=='video/mp4' and self.s.video_active:self.mp4(r)
@@ -81,13 +80,7 @@ class Capture:
         photo_path=photo_output_path(self.s.root,r.url,f'photo_{self.s.saved_photos+1:06}.jpg')
         already=key in self.s.photos and photo_path.is_file()
 
-        print("CURRENT KEY =", repr(key))
-        print("photo_active =", self.s.photo_active)
-        print("already =", already)
-
         if self.s.photo_active and not already:
-            print("保存処理へ")
-
             b=r.body()
 
             p=unique(photo_path)
@@ -98,8 +91,6 @@ class Capture:
             self.s.photos.add(key)
             self.s.saved_photos+=1
             self.s.save()
-
-            print('[PHOTO]',p)
     def mp4(self,r:Response):
         b=r.body(); cr=parse_range(r.headers.get('content-range',''))
         if cr:self.s.video_parts.append((*cr,b))
@@ -352,18 +343,6 @@ def photo_mode(page,args,c):
 
     print('写真一覧が開きました。ここから処理を開始します。')
 
-    print(f"現在URL: {page.url}")
-    print(f"ページタイトル: {page.title()}")
-
-    try:
-        print("imgタグ数:", page.locator("img").count())
-        print(
-        page.evaluate("""
-        () => document.body.innerText.substring(0,1000)
-        """)
-    )
-    except Exception as e:
-        print("img取得エラー:", e)
     # 現在表示されている分の遅延読み込みを待つ
     wait_for_current_media(page, c, 2.0)
 
@@ -499,9 +478,6 @@ def main():
     print("processed file =", s.root / '.processed.json')
     print("photos count =", len(s.photos))
     print("thumbs count =", len(s.thumbs))
-
-    for x in list(s.photos)[:10]:
-        print("PHOTO KEY =", repr(x))
 
     print("=" * 80)
 
