@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, re, signal
+import argparse, json, re, signal, time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +17,17 @@ def mime(r:Response)->str:return (r.headers.get("content-type") or "").split(";"
 def filename(url:str,fallback:str)->str:
     n=Path(urlsplit(url).path).name or fallback
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',n)
+
+def is_jpeg_url(url:str)->bool:
+    return re.search(r'\.jpe?g$',urlsplit(url).path,re.I) is not None
+
+def is_full_photo_url(url:str)->bool:
+    path=urlsplit(url).path.lower()
+    return '/files/' in path and is_jpeg_url(url)
+
+def is_thumbnail_url(url:str)->bool:
+    path=urlsplit(url).path.lower()
+    return re.search(r'/thumbnails?/',path) is not None and is_jpeg_url(url)
 
 def photo_output_path(root:Path,url:str,fallback:str)->Path:
     name=filename(url,fallback)
@@ -44,8 +55,11 @@ def parse_range(v:str):
 @dataclass
 class State:
     root:Path
+
     photos:set[str]=field(default_factory=set)
     thumbs:set[str]=field(default_factory=set)
+    thumbnail_urls:set[str]=field(default_factory=set)
+    download_mode:bool=False
     saved_photos:int=0
     saved_videos:int=0
     video_full:list[tuple[str,bytes]]=field(default_factory=list)
@@ -57,10 +71,15 @@ class State:
         p=self.root/'.processed.json'
         if p.exists():
             try:
-                d=json.loads(p.read_text(encoding='utf-8')); self.photos.update(d.get('photos',[])); self.thumbs.update(d.get('thumbnails',[]))
+                d=json.loads(p.read_text(encoding='utf-8'))
+                self.photos.update(d.get('photos',[]))
+                self.thumbs.update(d.get('thumbnails',[]))
             except Exception: pass
     def save(self):
-        (self.root/'.processed.json').write_text(json.dumps({'photos':sorted(self.photos),'thumbnails':sorted(self.thumbs)},ensure_ascii=False,indent=2),encoding='utf-8')
+        (self.root/'.processed.json').write_text(json.dumps({
+            'photos':sorted(self.photos),
+            'thumbnails':sorted(self.thumbs),
+        },ensure_ascii=False,indent=2),encoding='utf-8')
 
 class Capture:
     def __init__(self,page:Page,state:State):
@@ -71,26 +90,59 @@ class Capture:
         try:self.page.remove_listener('response',self.on_response)
         except Exception:pass
     def on_response(self,r:Response):
+
         try:
-            if mime(r)=='image/jpeg': self.jpeg(r)
-            elif mime(r)=='video/mp4' and self.s.video_active:self.mp4(r)
-        except Exception as e: print('response error:',e)
+
+            print(
+                mime(r),
+                r.url
+            )
+
+            if mime(r) == 'image/jpeg':
+                if is_thumbnail_url(r.url):
+                    self.s.thumbnail_urls.add(normalize_url(r.url))
+                self.jpeg(r)
+
+            elif mime(r) == 'video/mp4' and self.s.video_active:
+                self.mp4(r)
+
+        except Exception as e:
+            print('response error:',e)
     def jpeg(self,r:Response):
+        if not is_full_photo_url(r.url) or not self.s.download_mode:
+            return
+
         key=normalize_url(r.url)
-        photo_path=photo_output_path(self.s.root,r.url,f'photo_{self.s.saved_photos+1:06}.jpg')
-        already=key in self.s.photos and photo_path.is_file()
 
-        if self.s.photo_active and not already:
-            b=r.body()
+        photo_path=photo_output_path(
+            self.s.root,
+            r.url,
+            f'photo_{self.s.saved_photos+1:06}.jpg'
+        )
 
-            p=unique(photo_path)
+        already=photo_path.is_file()
 
-            p.parent.mkdir(parents=True,exist_ok=True)
-            p.write_bytes(b)
-
+        if already:
             self.s.photos.add(key)
-            self.s.saved_photos+=1
             self.s.save()
+            print("[SKIP]", photo_path.name, "(already exists)")
+            return
+
+        b=r.body()
+
+        p=unique(photo_path)
+
+        p.parent.mkdir(parents=True,exist_ok=True)
+
+        p.write_bytes(b)
+
+        self.s.photos.add(key)
+
+        self.s.saved_photos+=1
+
+        self.s.save()
+
+        print("[SAVE]", p.name)
     def mp4(self,r:Response):
         b=r.body(); cr=parse_range(r.headers.get('content-range',''))
         if cr:self.s.video_parts.append((*cr,b))
@@ -128,6 +180,53 @@ def targets(page:Page):
         g=(round(x),round(y))
         if g not in seen:seen.add(g);ans.append((s,i,k))
     return ans
+
+def photo_grid_positions(page:Page,max_clicks:int=43):
+    """Scan four thumbnail columns bottom-up inside the centered mobile view."""
+    size=page.viewport_size
+    if not size:
+        size=page.evaluate('({width:innerWidth,height:innerHeight})')
+    width,height=size['width'],size['height']
+
+    panel_width=min(430,width)
+    panel_left=(width-panel_width)/2
+    tile=panel_width*0.21
+    x_centers=[panel_left+panel_width*(0.145+0.235*column) for column in range(4)]
+
+    top_y=height/8+tile/2
+    bottom_y=height-tile/2
+    row_step=max(35,tile*0.55)
+    rows=[]
+    y=bottom_y
+    while y>=top_y and len(rows)<(max_clicks+3)//4:
+        rows.append(y)
+        y-=row_step
+
+    return [(x,y) for y in rows for x in x_centers][:max_clicks]
+
+def wait_after_photo_response(response_received_at:float)->None:
+    """Wait until 0.5 seconds have passed since a successful photo response."""
+    remaining=0.5-(time.monotonic()-response_received_at)
+    if remaining>0:
+        time.sleep(remaining)
+
+def wait_for_photo_grid(page:Page,c:Capture,initial_thumbnails:int,minimum_wait:float)->int:
+    """Wait for new thumbnail responses to settle after scrolling."""
+    deadline=time.monotonic()+max(minimum_wait,1.0)
+    hard_deadline=deadline+max(minimum_wait,2.0)
+    stable_since=time.monotonic()
+    last_thumbnails=initial_thumbnails
+
+    while time.monotonic()<deadline or (
+        time.monotonic()<hard_deadline and time.monotonic()-stable_since<0.8
+    ):
+        page.wait_for_timeout(250)
+        thumbnails=len(c.s.thumbnail_urls)
+        if thumbnails!=last_thumbnails:
+            last_thumbnails=thumbnails
+            stable_since=time.monotonic()
+
+    return last_thumbnails
 
 def click(page,s,i):
     try:page.locator(s).nth(i).scroll_into_view_if_needed(timeout=3000);page.locator(s).nth(i).click(timeout=5000);return True
@@ -304,80 +403,124 @@ def wait_for_current_media(page, c, seconds=2.0):
             deadline = page.evaluate('Date.now()') + int(seconds * 1000)
 
 
-def wait_for_media_list(page, timeout=30.0):
-    """URLが /media-list/ になるまで待つ。"""
+def wait_for_media_list(page, expected_url, timeout=30.0):
+    """Wait until the selected member's media-list URL is open."""
 
     print('メディア一覧への遷移を待っています...')
 
     deadline = page.evaluate('Date.now()') + int(timeout * 1000)
+    expected=urlsplit(expected_url)
+    expected_path=expected.path.rstrip('/')
 
     while page.evaluate('Date.now()') < deadline:
         try:
-            url = page.url
-
-            # URLの末尾が /media-list/ になったら一覧ページと判断
-            if url.endswith('/media-list'):
-                print(f'メディア一覧へ遷移しました: {url}')
+            current=urlsplit(page.url)
+            if (current.scheme.lower()==expected.scheme.lower()
+                    and current.netloc.lower()==expected.netloc.lower()
+                    and current.path.rstrip('/')==expected_path):
+                print(f'選択メンバーのメディア一覧へ遷移しました: {page.url}')
                 return True
-
         except Exception:
             pass
 
         page.wait_for_timeout(300)
 
-    print(f'{timeout}秒待っても /media-list へ遷移しませんでした。')
+    print(f'{timeout}秒以内に選択メンバーのメディア一覧へ遷移しませんでした。')
+    print(f'期待URL: {expected_url}')
     print(f'現在のURL: {page.url}')
 
     return False
 
 
-def photo_mode(page,args,c):
-    c.s.photo_active=True
+def photo_mode(page, args, c):
+
+    c.s.download_mode = True
 
     print('写真一覧が開くのを待っています...')
 
     # 一覧が実際に表示されるまで待つ
-    if not wait_for_media_list(page, 15.0):
+    if not wait_for_media_list(page, args.media_list_url, 15.0):
         print('写真一覧を確認できないため終了します。')
         return
 
-    print('写真一覧が開きました。ここから処理を開始します。')
+    print('写真一覧が開きました。画面上の4列グリッドを下段からクリックします。')
 
-    # 現在表示されている分の遅延読み込みを待つ
     wait_for_current_media(page, c, 2.0)
-
-    print(f'現在表示分のJPEG保存完了: {c.s.saved_photos}件')
-
-    no_new_scrolls = 0
-    last_sig = media_signature(page)
+    no_new_scrolls=0
 
     while c.s.saved_photos < args.max_items:
-        before_saved = c.s.saved_photos
-        before, after = scroll_up(page)
-        print(f'写真一覧を上へスクロール: {before} -> {after}')
+        positions=photo_grid_positions(page)
+        opened_nearby=[]
+        click_count=0
+        print(f'この画面のクリック範囲: 上端{100/8:.1f}%を除外、最大{len(positions)}地点')
+        for x,y in positions:
+            if c.s.saved_photos>=args.max_items:
+                break
+            if any(abs(opened_x-x)<45 and abs(opened_y-y)<85
+                   for opened_x,opened_y in opened_nearby):
+                continue
+            click_count+=1
+            before_saved=c.s.saved_photos
+            response_received_at=None
+            try:
+                with page.expect_response(
+                    lambda response:is_full_photo_url(response.url) and mime(response)=='image/jpeg',
+                    timeout=int(args.photo_wait*1000),
+                ) as response_info:
+                    page.mouse.click(x,y)
+                response=response_info.value
+                response_received_at=time.monotonic()
+                opened_nearby.append((x,y))
+                if c.s.saved_photos>before_saved:
+                    print(f'[PHOTO] 保存しました: {filename(response.url,"photo.jpg")}')
+                else:
+                    print(f'[PHOTO] 保存済み: {filename(response.url,"photo.jpg")}')
+            except PlaywrightTimeoutError:
+                print(f'[PHOTO] 座標クリック ({x:.0f}, {y:.0f}) 後に /files/ のJPEG応答がありません')
+            except Exception as e:
+                print(f'[PHOTO] 座標クリック失敗 ({x:.0f}, {y:.0f}):',e)
+            finally:
+                if response_received_at is not None:
+                    page.wait_for_timeout(200)
+                try:
+                    page.keyboard.press('Escape')
+                    print('[PHOTO] Escapeを送信しました')
+                except Exception as e:
+                    print('[PHOTO] Escape送信に失敗しました:',e)
+                if response_received_at is not None:
+                    wait_after_photo_response(response_received_at)
 
-        # スクロールによる遅延読み込みが終わり、新しいJPEGレスポンスが返るまで待つ。
-        wait_for_current_media(page, c, max(1.0, args.scroll_pause))
-        after_saved = c.s.saved_photos
-        new_sig = media_signature(page)
+        print(f'この画面のクリック完了: {click_count}/{len(positions)}地点')
+        thumbnail_count_before=len(c.s.thumbnail_urls)
+        view=page.locator('flutter-view')
+        try:
+            box=view.bounding_box(timeout=1000)
+        except Exception:
+            box=None
+        if not box:
+            size=page.viewport_size or page.evaluate('({width:innerWidth,height:innerHeight})')
+            box={'x':0,'y':0,'width':size['width'],'height':size['height']}
 
-        if after_saved > before_saved:
-            no_new_scrolls = 0
-            print(f'新規JPEGを保存: +{after_saved-before_saved}件 / 累計 {after_saved}件')
+        page.mouse.move(box['x']+box['width']/2,box['y']+box['height']/2)
+        page.mouse.wheel(0,-max(300,int(box['height']*0.7*1.15*1.1)))
+        scroll_wait=min(8.0,max(args.scroll_pause,1.0+no_new_scrolls*1.5))
+        print(f'サムネイル読込待ち: {scroll_wait:.1f}秒')
+        thumbnail_count_after=wait_for_photo_grid(
+            page,c,thumbnail_count_before,scroll_wait
+        )
+
+        if thumbnail_count_after==thumbnail_count_before:
+            no_new_scrolls+=1
+            print(f'スクロール後に新規サムネイル通信なし: {no_new_scrolls}/{args.max_no_change}回')
         else:
-            no_new_scrolls += 1
-            print(f'新規JPEGなし: {no_new_scrolls}/{args.max_no_change}回')
+            no_new_scrolls=0
+            print(f'新規サムネイル通信を検出。受信済みURL: {thumbnail_count_after}件')
 
-        # スクロール先が変わらず、かつ新しいJPEGも来ない場合も終了候補。
-        if before == after and new_sig == last_sig:
-            no_new_scrolls = max(no_new_scrolls, 1)
-        last_sig = new_sig
-
-        if no_new_scrolls >= args.max_no_change:
-            print(f'上方向へ{args.max_no_change}回スクロールしても新規JPEGがないため終了します。')
+        if no_new_scrolls>=args.max_no_change:
+            print(f'上方向へ{args.max_no_change}回スクロールしても新規サムネイル通信がないため終了します。')
             break
 
-    print('写真終了:',c.s.saved_photos)
+    print('写真処理終了:',c.s.saved_photos)
 
 def video_mode(page,args,c):
     video_tab(page,args.video_tab_index)
@@ -386,7 +529,7 @@ def video_mode(page,args,c):
     print('動画一覧が開くのを待っています...')
 
     # 動画タブを開いた後、実際に一覧が表示されるまで待つ
-    if not wait_for_media_list(page, 15.0):
+    if not wait_for_media_list(page, args.media_list_url, 15.0):
         print('動画一覧を確認できないため終了します。')
         return
 
@@ -468,6 +611,7 @@ def main():
     ap.add_argument('--max-no-change',type=int,default=4)
     ap.add_argument('--video-tab-index',type=int,default=1)
     ap.add_argument('--video-wait',type=float,default=8)
+    ap.add_argument('--photo-wait',type=float,default=1.0)
     ap.add_argument('--skip-navigation',action='store_true')
     args=ap.parse_args()
 
@@ -482,16 +626,24 @@ def main():
     print("=" * 80)
 
     with sync_playwright() as pw:
-        b,page=connect(pw,args.cdp_url)
+        _,page=connect(pw,args.cdp_url)
         c=Capture(page,s)
         c.start()
 
         try:
-            if not args.skip_navigation:
+            current=urlsplit(page.url)
+            target=urlsplit(args.media_list_url)
+            same_target=(
+                current.scheme.lower()==target.scheme.lower()
+                and current.netloc.lower()==target.netloc.lower()
+                and current.path.rstrip('/')==target.path.rstrip('/')
+            )
+            if not same_target:
+                print(f'現在のURLが対象メンバーと異なるため移動します: {args.media_list_url}')
                 page.goto(args.media_list_url, wait_until='domcontentloaded')
                 page.wait_for_timeout(1500)
             else:
-                print(f'現在のEdge URL: {page.url}')
+                print(f'対象メンバーの一覧URLを確認しました: {page.url}')
 
             if args.mode == 'photo':
                 photo_mode(page,args,c)

@@ -314,8 +314,9 @@ class Launcher(tk.Tk):
                         common + [
                             "--mode", "photo",
                             "--max-items", "999999",
-                            "--max-no-change", "3",
+                            "--max-no-change", "5",
                             "--scroll-pause", "1",
+                            "--photo-wait", "1",
                         ],
                         cwd=PROJECT_ROOT,
                         text=True,
