@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, re, signal, time
+import argparse, json, re, time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +40,34 @@ def photo_output_path(root:Path,url:str,fallback:str)->Path:
             pass
     return root/'photo'/name
 
+def audio_suffix(content_type:str)->str:
+    subtype=content_type.partition('/')[2].split(';',1)[0].lower()
+    return {
+        'mpeg':'.mp3',
+        'mp3':'.mp3',
+        'mp4':'.m4a',
+        'x-m4a':'.m4a',
+        'aac':'.aac',
+        'wav':'.wav',
+        'x-wav':'.wav',
+        'ogg':'.ogg',
+        'webm':'.webm',
+        'flac':'.flac',
+        '3gpp':'.3gp',
+        '3gpp2':'.3g2',
+    }.get(subtype,f'.{subtype}' if re.fullmatch(r'[a-z0-9.+-]+',subtype) else '.audio')
+
+def audio_output_path(root:Path,url:str,content_type:str,fallback:str)->Path:
+    name=filename(url,fallback)
+    suffix=audio_suffix(content_type)
+    if Path(name).suffix.lower()!=suffix:
+        name=f'{Path(name).stem}{suffix}'
+    return root/'audio'/name
+
+def video_filename(url:str,fallback:str)->str:
+    name=filename(url,fallback)
+    return name if Path(name).suffix.lower()=='.mp4' else f'{Path(name).stem}.mp4'
+
 def unique(p:Path)->Path:
     if not p.exists(): return p
     for i in range(2,100000):
@@ -58,14 +86,18 @@ class State:
 
     photos:set[str]=field(default_factory=set)
     thumbs:set[str]=field(default_factory=set)
+    audio_keys:set[str]=field(default_factory=set)
     thumbnail_urls:set[str]=field(default_factory=set)
     download_mode:bool=False
     saved_photos:int=0
     saved_videos:int=0
+    saved_audio:int=0
     video_full:list[tuple[str,bytes]]=field(default_factory=list)
     video_parts:list[tuple[int,int,int|None,bytes]]=field(default_factory=list)
+    audio_full:list[tuple[str,str,bytes]]=field(default_factory=list)
+    audio_parts:list[tuple[int,int,int|None,str,str,bytes]]=field(default_factory=list)
     photo_active:bool=False
-    video_active:bool=False
+    audio_active:bool=False
     def load(self):
         self.root.mkdir(parents=True,exist_ok=True)
         p=self.root/'.processed.json'
@@ -74,11 +106,13 @@ class State:
                 d=json.loads(p.read_text(encoding='utf-8'))
                 self.photos.update(d.get('photos',[]))
                 self.thumbs.update(d.get('thumbnails',[]))
+                self.audio_keys.update(d.get('audio',[]))
             except Exception: pass
     def save(self):
         (self.root/'.processed.json').write_text(json.dumps({
             'photos':sorted(self.photos),
             'thumbnails':sorted(self.thumbs),
+            'audio':sorted(self.audio_keys),
         },ensure_ascii=False,indent=2),encoding='utf-8')
 
 class Capture:
@@ -103,8 +137,11 @@ class Capture:
                     self.s.thumbnail_urls.add(normalize_url(r.url))
                 self.jpeg(r)
 
-            elif mime(r) == 'video/mp4' and self.s.video_active:
-                self.mp4(r)
+            elif (
+                self.s.audio_active
+                and mime(r) in {'audio/mp4', 'video/mp4'}
+            ):
+                self.audio(r)
 
         except Exception as e:
             print('response error:',e)
@@ -147,6 +184,14 @@ class Capture:
         b=r.body(); cr=parse_range(r.headers.get('content-range',''))
         if cr:self.s.video_parts.append((*cr,b))
         else:self.s.video_full.append((r.url,b))
+    def audio(self,r:Response):
+        content_type=mime(r)
+        body=r.body()
+        content_range=parse_range(r.headers.get('content-range',''))
+        if content_range:
+            self.s.audio_parts.append((*content_range,r.url,content_type,body))
+        else:
+            self.s.audio_full.append((r.url,content_type,body))
 
 def connect(p:Playwright,cdp:str):
     try:b=p.chromium.connect_over_cdp(cdp,timeout=15000)
@@ -154,32 +199,6 @@ def connect(p:Playwright,cdp:str):
     pages=[x for c in b.contexts for x in c.pages]
     if not pages:raise RuntimeError('Edgeにタブがありません')
     return b,pages[-1]
-
-def video_tab(page:Page,index:int):
-    try:
-        x=page.locator('[role="tablist"] [role="button"]')
-        if x.count()>index:x.nth(index).click(timeout=5000);page.wait_for_timeout(800);return
-    except Exception:pass
-    x=page.get_by_text(re.compile('動画'))
-    if x.count():x.last.click(timeout=5000);page.wait_for_timeout(800);return
-    raise RuntimeError('動画タブを見つけられません')
-
-def targets(page:Page):
-    out=[]
-    for sel in ('[role="button"]','[role="img"]','img','video'):
-        loc=page.locator(sel)
-        for i in range(loc.count()):
-            try:b=loc.nth(i).bounding_box()
-            except Exception:b=None
-            if not b or b['width']<40 or b['height']<40 or b['y']<80:continue
-            src=loc.nth(i).get_attribute('src') or loc.nth(i).get_attribute('href') or ''
-            key=normalize_url(src) if src else f'{sel}:{round(b["x"])}:{round(b["y"])}:{round(b["width"])}:{round(b["height"])}'
-            out.append((b['y'],b['x'],sel,i,key))
-    out.sort(key=lambda x:(round(x[0]/10),x[1])); seen=set(); ans=[]
-    for y,x,s,i,k in out:
-        g=(round(x),round(y))
-        if g not in seen:seen.add(g);ans.append((s,i,k))
-    return ans
 
 def photo_grid_positions(page:Page,max_clicks:int=43):
     """Scan four thumbnail columns bottom-up inside the centered mobile view."""
@@ -204,8 +223,18 @@ def photo_grid_positions(page:Page,max_clicks:int=43):
 
     return [(x,y) for y in rows for x in x_centers][:max_clicks]
 
-def wait_after_photo_response(response_received_at:float)->None:
-    """Wait until 0.5 seconds have passed since a successful photo response."""
+def audio_row_positions(page:Page,max_rows:int=7):
+    size=page.viewport_size
+    if not size:
+        size=page.evaluate('({width:innerWidth,height:innerHeight})')
+    width,height=size['width'],size['height']
+    center_x=width/2
+    first_row=height*0.185
+    row_step=height*0.09
+    return [(center_x,first_row+row_step*row) for row in range(max_rows)]
+
+def wait_after_media_response(response_received_at:float)->None:
+    """Wait until 0.5 seconds have passed since a successful media response."""
     remaining=0.5-(time.monotonic()-response_received_at)
     if remaining>0:
         time.sleep(remaining)
@@ -227,6 +256,20 @@ def wait_for_photo_grid(page:Page,c:Capture,initial_thumbnails:int,minimum_wait:
             stable_since=time.monotonic()
 
     return last_thumbnails
+
+def scroll_media_list(page:Page,pause:float)->None:
+    view=page.locator('flutter-view')
+    try:
+        box=view.bounding_box(timeout=1000)
+    except Exception:
+        box=None
+    if not box:
+        size=page.viewport_size or page.evaluate('({width:innerWidth,height:innerHeight})')
+        box={'x':0,'y':0,'width':size['width'],'height':size['height']}
+
+    page.mouse.move(box['x']+box['width']/2,box['y']+box['height']/2)
+    page.mouse.wheel(0,-max(300,int(box['height']*0.7*1.15*1.1)))
+    page.wait_for_timeout(int(max(1.0,pause)*1000))
 
 def click(page,s,i):
     try:page.locator(s).nth(i).scroll_into_view_if_needed(timeout=3000);page.locator(s).nth(i).click(timeout=5000);return True
@@ -377,9 +420,9 @@ def media_signature(page):
         return ''
 
 def save_video(s:State):
-    d=s.root/'videos';d.mkdir(parents=True,exist_ok=True)
+    d=s.root/'video';d.mkdir(parents=True,exist_ok=True)
     if s.video_full:
-        u,b=s.video_full[-1];p=unique(d/filename(u,f'video_{s.saved_videos+1:06}.mp4'));p.write_bytes(b);s.saved_videos+=1;return True
+        u,b=s.video_full[-1];p=unique(d/video_filename(u,f'video_{s.saved_videos+1:06}.mp4'));p.write_bytes(b);s.saved_videos+=1;return True
     parts=sorted(s.video_parts)
     pos=0;total=None;chunks=[]
     for st,en,to,b in parts:
@@ -388,6 +431,45 @@ def save_video(s:State):
     if total is not None and pos!=total:return False
     if not chunks:return False
     p=unique(d/f'video_{s.saved_videos+1:06}.mp4');p.write_bytes(b''.join(chunks));s.saved_videos+=1;return True
+
+def save_audio(s:State)->bool:
+    if s.audio_full:
+        url,content_type,body=s.audio_full[-1]
+    else:
+        parts=sorted(s.audio_parts)
+        position=0
+        total=None
+        chunks=[]
+        for start,end,part_total,_,_,body in parts:
+            if start!=position:
+                return False
+            chunks.append(body)
+            position=end+1
+            total=part_total or total
+        if not chunks or (total is not None and position!=total):
+            return False
+        _,_,_,url,content_type,_=parts[0]
+        body=b''.join(chunks)
+
+    key=normalize_url(url)
+    if key in s.audio_keys:
+        print('[AUDIO] 保存済み:',filename(url,'audio'))
+        return True
+
+    path=audio_output_path(
+        s.root,
+        url,
+        content_type,
+        f'audio_{s.saved_audio+1:06}{audio_suffix(content_type)}',
+    )
+    path.parent.mkdir(parents=True,exist_ok=True)
+    destination=unique(path)
+    destination.write_bytes(body)
+    s.audio_keys.add(key)
+    s.saved_audio+=1
+    s.save()
+    print('[AUDIO] 保存しました:',destination.name)
+    return True
 
 
 def wait_for_current_media(page, c, seconds=2.0):
@@ -432,77 +514,96 @@ def wait_for_media_list(page, expected_url, timeout=30.0):
     return False
 
 
-def photo_mode(page, args, c):
+def grid_mode(page,args,c,media_type:str):
+    photo_mode=media_type=='photo'
+    c.s.download_mode=photo_mode
+    c.s.photo_active=photo_mode
+    c.s.root.joinpath(media_type).mkdir(parents=True,exist_ok=True)
+    print(f'現在の画面で{media_type}の取得を開始します。')
 
-    c.s.download_mode = True
-
-    print('写真一覧が開くのを待っています...')
-
-    # 一覧が実際に表示されるまで待つ
-    if not wait_for_media_list(page, args.media_list_url, 15.0):
-        print('写真一覧を確認できないため終了します。')
-        return
-
-    print('写真一覧が開きました。画面上の4列グリッドを下段からクリックします。')
-
-    wait_for_current_media(page, c, 2.0)
+    if photo_mode:
+        wait_for_current_media(page,c,2.0)
     no_new_scrolls=0
 
-    while c.s.saved_photos < args.max_items:
+    def processed_count()->int:
+        return c.s.saved_photos if photo_mode else c.s.saved_videos
+
+    while processed_count()<args.max_items:
         positions=photo_grid_positions(page)
         opened_nearby=[]
         click_count=0
+        stop_video_scan=False
         print(f'この画面のクリック範囲: 上端{100/8:.1f}%を除外、最大{len(positions)}地点')
         for x,y in positions:
-            if c.s.saved_photos>=args.max_items:
+            if processed_count()>=args.max_items:
                 break
             if any(abs(opened_x-x)<45 and abs(opened_y-y)<85
                    for opened_x,opened_y in opened_nearby):
                 continue
             click_count+=1
-            before_saved=c.s.saved_photos
+            before_saved=processed_count()
             response_received_at=None
+            video_saved=False
+            if not photo_mode:
+                c.s.video_full.clear()
+                c.s.video_parts.clear()
             try:
                 with page.expect_response(
-                    lambda response:is_full_photo_url(response.url) and mime(response)=='image/jpeg',
-                    timeout=int(args.photo_wait*1000),
+                    lambda response:(
+                        is_full_photo_url(response.url) and mime(response)=='image/jpeg'
+                        if photo_mode else mime(response)=='video/mp4'
+                    ),
+                    timeout=int((args.photo_wait if photo_mode else args.video_wait)*1000),
                 ) as response_info:
                     page.mouse.click(x,y)
                 response=response_info.value
                 response_received_at=time.monotonic()
-                opened_nearby.append((x,y))
-                if c.s.saved_photos>before_saved:
-                    print(f'[PHOTO] 保存しました: {filename(response.url,"photo.jpg")}')
+                if photo_mode:
+                    opened_nearby.append((x,y))
+                    result_count=c.s.saved_photos
+                    result_type='PHOTO'
                 else:
-                    print(f'[PHOTO] 保存済み: {filename(response.url,"photo.jpg")}')
+                    c.mp4(response)
+                    saved=save_video(c.s)
+                    video_saved=saved
+                    result_count=c.s.saved_videos
+                    result_type='VIDEO'
+                    if not saved:
+                        print('[VIDEO] MP4全体の受信が完了していません。')
+                        stop_video_scan=True
+                    else:
+                        opened_nearby.append((x,y))
+                if result_count>before_saved:
+                    print(f'[{result_type}] 保存しました: {filename(response.url,"media")}')
+                else:
+                    print(f'[{result_type}] 保存済みまたは未保存: {filename(response.url,"media")}')
             except PlaywrightTimeoutError:
-                print(f'[PHOTO] 座標クリック ({x:.0f}, {y:.0f}) 後に /files/ のJPEG応答がありません')
+                expected='JPEG' if photo_mode else 'video/mp4'
+                print(f'[{media_type.upper()}] 座標クリック ({x:.0f}, {y:.0f}) 後に {expected} 応答がありません')
             except Exception as e:
-                print(f'[PHOTO] 座標クリック失敗 ({x:.0f}, {y:.0f}):',e)
+                print(f'[{media_type.upper()}] 座標クリック失敗 ({x:.0f}, {y:.0f}):',e)
+                if not photo_mode and response_received_at is not None:
+                    stop_video_scan=True
             finally:
-                if response_received_at is not None:
-                    page.wait_for_timeout(200)
-                try:
-                    page.keyboard.press('Escape')
-                    print('[PHOTO] Escapeを送信しました')
-                except Exception as e:
-                    print('[PHOTO] Escape送信に失敗しました:',e)
-                if response_received_at is not None:
-                    wait_after_photo_response(response_received_at)
+                if photo_mode or video_saved:
+                    try:
+                        page.keyboard.press('Escape')
+                        print(f'[{media_type.upper()}] Escapeを送信しました')
+                    except Exception as e:
+                        print(f'[{media_type.upper()}] Escape送信に失敗しました:',e)
+                    if response_received_at is not None:
+                        wait_after_media_response(response_received_at)
+            if stop_video_scan:
+                break
 
         print(f'この画面のクリック完了: {click_count}/{len(positions)}地点')
+        if stop_video_scan:
+            print('[VIDEO] 完全なMP4を保存できなかったため、次のクリックやEscapeは行わず処理を止めます。')
+            break
+        if processed_count()>=args.max_items:
+            break
         thumbnail_count_before=len(c.s.thumbnail_urls)
-        view=page.locator('flutter-view')
-        try:
-            box=view.bounding_box(timeout=1000)
-        except Exception:
-            box=None
-        if not box:
-            size=page.viewport_size or page.evaluate('({width:innerWidth,height:innerHeight})')
-            box={'x':0,'y':0,'width':size['width'],'height':size['height']}
-
-        page.mouse.move(box['x']+box['width']/2,box['y']+box['height']/2)
-        page.mouse.wheel(0,-max(300,int(box['height']*0.7*1.15*1.1)))
+        scroll_media_list(page,args.scroll_pause)
         scroll_wait=min(8.0,max(args.scroll_pause,1.0+no_new_scrolls*1.5))
         print(f'サムネイル読込待ち: {scroll_wait:.1f}秒')
         thumbnail_count_after=wait_for_photo_grid(
@@ -520,99 +621,70 @@ def photo_mode(page, args, c):
             print(f'上方向へ{args.max_no_change}回スクロールしても新規サムネイル通信がないため終了します。')
             break
 
-    print('写真処理終了:',c.s.saved_photos)
+    print(f'{media_type}処理終了:',processed_count())
+
+def audio_mode(page,args,c):
+    c.s.audio_active=True
+    c.s.root.joinpath('audio').mkdir(parents=True,exist_ok=True)
+    print('現在の画面で音声の取得を開始します。各行の中央を1回ずつクリックします。')
+    no_new_scrolls=0
+    while c.s.saved_audio<args.max_items:
+        before_saved=c.s.saved_audio
+        for x,y in audio_row_positions(page):
+            if c.s.saved_audio>=args.max_items:
+                break
+            c.s.audio_full.clear()
+            c.s.audio_parts.clear()
+            response_received_at=None
+            try:
+                with page.expect_response(
+                    lambda response:mime(response) in {'audio/mp4', 'video/mp4'},
+                    timeout=int(args.audio_wait*1000),
+                ) as response_info:
+                    page.mouse.click(x,y)
+                response=response_info.value
+                response_received_at=time.monotonic()
+                page.wait_for_timeout(200)
+                if save_audio(c.s):
+                    print('[AUDIO] 応答:',filename(response.url,'audio'))
+            except PlaywrightTimeoutError:
+                print(f'[AUDIO] 行クリック ({x:.0f}, {y:.0f}) 後に音声応答がありません')
+            except Exception as e:
+                print(f'[AUDIO] 行クリック失敗 ({x:.0f}, {y:.0f}):',e)
+            finally:
+                if response_received_at is not None:
+                    wait_after_media_response(response_received_at)
+
+        if c.s.saved_audio==before_saved:
+            no_new_scrolls+=1
+            print(f'新しい音声応答なし: {no_new_scrolls}/{args.max_no_change}回')
+        else:
+            no_new_scrolls=0
+
+        scroll_media_list(page,args.scroll_pause)
+        if no_new_scrolls>=args.max_no_change:
+            print(f'{args.max_no_change}回スクロールしても新しい音声応答がないため終了します。')
+            break
+
+    print('音声処理終了:',c.s.saved_audio)
+
+def photo_mode(page,args,c):
+    grid_mode(page,args,c,'photo')
 
 def video_mode(page,args,c):
-    video_tab(page,args.video_tab_index)
-    c.s.video_active=True
-
-    print('動画一覧が開くのを待っています...')
-
-    # 動画タブを開いた後、実際に一覧が表示されるまで待つ
-    if not wait_for_media_list(page, args.media_list_url, 15.0):
-        print('動画一覧を確認できないため終了します。')
-        return
-
-    print('動画一覧が開きました。ここから処理を開始します。')
-
-    opened=set()
-    no_new_scrolls=0
-    last_sig=media_signature(page)
-
-    # 現在見えている動画を先に処理する。
-    while len(opened) < args.max_items:
-        ts=targets(page)
-        new=[x for x in ts if x[2] not in opened and x[2] not in c.s.thumbs]
-        if not new:
-            break
-        for sel,i,key in new:
-            opened.add(key)
-            c.s.thumbs.add(key)
-            c.s.save()
-            c.s.video_full.clear(); c.s.video_parts.clear()
-            if click(page,sel,i):
-                page.wait_for_timeout(int(args.video_wait*1000))
-                if save_video(c.s):
-                    print('[VIDEO] saved',c.s.saved_videos)
-                else:
-                    print('[VIDEO] complete MP4 not captured')
-                try: page.keyboard.press('Escape')
-                except Exception: pass
-                page.wait_for_timeout(int(args.click_interval*1000))
-
-    # 現在分を処理し終えたら上へスクロールし、新しいJPEGサムネイルが要求されたら続ける。
-    while len(opened) < args.max_items:
-        before_count=len(opened)
-        before, after=scroll_up(page)
-        print(f'動画一覧を上へスクロール: {before} -> {after}')
-        page.wait_for_timeout(int(max(1.0,args.scroll_pause)*1000))
-
-        ts=targets(page)
-        new=[x for x in ts if x[2] not in opened and x[2] not in c.s.thumbs]
-        new_sig=media_signature(page)
-
-        if new:
-            no_new_scrolls=0
-            print(f'新規動画サムネイル: {len(new)}件')
-            for sel,i,key in new:
-                opened.add(key)
-                c.s.thumbs.add(key)
-                c.s.save()
-                c.s.video_full.clear(); c.s.video_parts.clear()
-                if click(page,sel,i):
-                    page.wait_for_timeout(int(args.video_wait*1000))
-                    if save_video(c.s): print('[VIDEO] saved',c.s.saved_videos)
-                    else: print('[VIDEO] complete MP4 not captured')
-                    try: page.keyboard.press('Escape')
-                    except Exception: pass
-                    page.wait_for_timeout(int(args.click_interval*1000))
-        else:
-            no_new_scrolls += 1
-            print(f'新規動画サムネイルなし: {no_new_scrolls}/{args.max_no_change}回')
-
-        if before==after and new_sig==last_sig:
-            no_new_scrolls=max(no_new_scrolls,1)
-        last_sig=new_sig
-        if no_new_scrolls>=args.max_no_change:
-            print(f'上方向へ{args.max_no_change}回スクロールしても新規動画がないため終了します。')
-            break
-
-    print('動画終了:',c.s.saved_videos)
+    grid_mode(page,args,c,'video')
 
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--cdp-url',required=True)
-    ap.add_argument('--media-list-url',required=True)
-    ap.add_argument('--mode',choices=['photo','video'],required=True)
+    ap.add_argument('--mode',choices=['photo','video','audio'],required=True)
     ap.add_argument('--output-dir',default='output')
     ap.add_argument('--max-items',type=int,default=100000)
     ap.add_argument('--scroll-pause',type=float,default=1)
-    ap.add_argument('--click-interval',type=float,default=1)
     ap.add_argument('--max-no-change',type=int,default=4)
-    ap.add_argument('--video-tab-index',type=int,default=1)
-    ap.add_argument('--video-wait',type=float,default=8)
+    ap.add_argument('--video-wait',type=float,default=2)
     ap.add_argument('--photo-wait',type=float,default=1.0)
-    ap.add_argument('--skip-navigation',action='store_true')
+    ap.add_argument('--audio-wait',type=float,default=2)
     args=ap.parse_args()
 
     s=State(Path(args.output_dir))
@@ -631,27 +703,20 @@ def main():
         c.start()
 
         try:
-            current=urlsplit(page.url)
-            target=urlsplit(args.media_list_url)
-            same_target=(
-                current.scheme.lower()==target.scheme.lower()
-                and current.netloc.lower()==target.netloc.lower()
-                and current.path.rstrip('/')==target.path.rstrip('/')
-            )
-            if not same_target:
-                print(f'現在のURLが対象メンバーと異なるため移動します: {args.media_list_url}')
-                page.goto(args.media_list_url, wait_until='domcontentloaded')
-                page.wait_for_timeout(1500)
-            else:
-                print(f'対象メンバーの一覧URLを確認しました: {page.url}')
-
-            if args.mode == 'photo':
+            print(f'現在のブラウザ画面を使用します: {page.url}')
+            if not urlsplit(page.url).path.rstrip('/').endswith('/media-list'):
+                raise RuntimeError(
+                    'メディア一覧画面が開かれていません。ブラウザで一覧を開いてから再実行してください。'
+                )
+            if args.mode=='photo':
                 photo_mode(page,args,c)
-            else:
+            elif args.mode=='video':
                 video_mode(page,args,c)
+            else:
+                audio_mode(page,args,c)
 
         finally:
             c.stop()
 
-    print(f'完了 写真={s.saved_photos} 動画={s.saved_videos}')
+    print(f'完了 写真={s.saved_photos} 動画={s.saved_videos} 音声={s.saved_audio}')
 if __name__=='__main__':main()
