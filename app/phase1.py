@@ -200,8 +200,8 @@ def connect(p:Playwright,cdp:str):
     if not pages:raise RuntimeError('Edgeにタブがありません')
     return b,pages[-1]
 
-def photo_grid_positions(page:Page,max_clicks:int=43):
-    """Scan four thumbnail columns bottom-up inside the centered mobile view."""
+def photo_grid_positions(page:Page,max_clicks:int=174):
+    """Scan the centered mobile view with twice the horizontal and vertical sampling density."""
     size=page.viewport_size
     if not size:
         size=page.evaluate('({width:innerWidth,height:innerHeight})')
@@ -210,18 +210,39 @@ def photo_grid_positions(page:Page,max_clicks:int=43):
     panel_width=min(430,width)
     panel_left=(width-panel_width)/2
     tile=panel_width*0.21
-    x_centers=[panel_left+panel_width*(0.145+0.235*column) for column in range(4)]
+    columns=8
+    x_centers=[
+        panel_left+panel_width*(0.145+0.235*3*column/(columns-1))
+        for column in range(columns)
+    ]
 
     top_y=height/8+tile/2
     bottom_y=height-tile/2
-    row_step=max(35,tile*0.55)
+    row_step=max(35,tile*0.55)/2
     rows=[]
     y=bottom_y
-    while y>=top_y and len(rows)<(max_clicks+3)//4:
+    while y>=top_y and len(rows)<(max_clicks+columns-1)//columns:
         rows.append(y)
         y-=row_step
 
-    return [(x,y) for y in rows for x in x_centers][:max_clicks]
+    positions=[]
+    for row_index,y in enumerate(rows):
+        remaining=max_clicks-len(positions)
+        if remaining<=0:
+            break
+        if row_index==len(rows)-1 and remaining<columns:
+            if remaining==1:
+                column_indexes=[columns-1]
+            else:
+                column_indexes=[
+                    round(i*(columns-1)/(remaining-1))
+                    for i in range(remaining)
+                ]
+        else:
+            column_indexes=range(columns)
+        positions.extend((x_centers[i],y) for i in column_indexes)
+
+    return positions
 
 def audio_row_positions(page:Page,max_rows:int=7):
     size=page.viewport_size
@@ -268,7 +289,7 @@ def scroll_media_list(page:Page,pause:float)->None:
         box={'x':0,'y':0,'width':size['width'],'height':size['height']}
 
     page.mouse.move(box['x']+box['width']/2,box['y']+box['height']/2)
-    page.mouse.wheel(0,-max(300,int(box['height']*0.7*1.15*1.1)))
+    page.mouse.wheel(0,-max(300,int(box['height']*0.7)))
     page.wait_for_timeout(int(max(1.0,pause)*1000))
 
 def click(page,s,i):
