@@ -21,6 +21,9 @@ def is_jpeg_data(data:bytes)->bool:
 def is_jpeg_response(r:Response)->bool:
     return is_jpeg_data(r.body())
 
+def url_extension(url:str)->str:
+    return Path(urlsplit(url).path).suffix.lower() or "(なし)"
+
 def filename(url:str,fallback:str)->str:
     n=Path(urlsplit(url).path).name or fallback
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',n)
@@ -139,13 +142,20 @@ class Capture:
                 r.url
             )
 
-            if (
-                (is_full_photo_url(r.url) or is_thumbnail_url(r.url))
-                and is_jpeg_response(r)
-            ):
+            if is_full_photo_url(r.url) or is_thumbnail_url(r.url):
+                body=r.body()
+                if not is_jpeg_data(body):
+                    print(
+                        "[JPEG判定NG]",
+                        f"URL拡張子={url_extension(r.url)}",
+                        f"Content-Type={mime(r) or '(なし)'}",
+                        f"先頭バイト={body[:16].hex(' ')}",
+                        r.url,
+                    )
+                    return
                 if is_thumbnail_url(r.url):
                     self.s.thumbnail_urls.add(normalize_url(r.url))
-                self.jpeg(r)
+                self.jpeg(r,body)
 
             elif (
                 self.s.audio_active
@@ -155,7 +165,7 @@ class Capture:
 
         except Exception as e:
             print('response error:',e)
-    def jpeg(self,r:Response):
+    def jpeg(self,r:Response,body:bytes):
         if not is_full_photo_url(r.url) or not self.s.download_mode:
             return
 
@@ -175,15 +185,11 @@ class Capture:
             print("[SKIP]", photo_path.name, "(already exists)")
             return
 
-        b=r.body()
-        if not is_jpeg_data(b):
-            return
-
         p=unique(photo_path)
 
         p.parent.mkdir(parents=True,exist_ok=True)
 
-        p.write_bytes(b)
+        p.write_bytes(body)
 
         self.s.photos.add(key)
 
