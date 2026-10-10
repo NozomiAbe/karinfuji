@@ -14,6 +14,13 @@ def normalize_url(url:str)->str:
     return urlunsplit((p.scheme.lower(),p.netloc.lower(),p.path,urlencode(q,doseq=True),""))
 
 def mime(r:Response)->str:return (r.headers.get("content-type") or "").split(";",1)[0].strip().lower()
+
+def is_jpeg_data(data:bytes)->bool:
+    return data.startswith(b'\xff\xd8\xff')
+
+def is_jpeg_response(r:Response)->bool:
+    return is_jpeg_data(r.body())
+
 def filename(url:str,fallback:str)->str:
     n=Path(urlsplit(url).path).name or fallback
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',n)
@@ -132,7 +139,10 @@ class Capture:
                 r.url
             )
 
-            if mime(r) == 'image/jpeg':
+            if (
+                (is_full_photo_url(r.url) or is_thumbnail_url(r.url))
+                and is_jpeg_response(r)
+            ):
                 if is_thumbnail_url(r.url):
                     self.s.thumbnail_urls.add(normalize_url(r.url))
                 self.jpeg(r)
@@ -166,6 +176,8 @@ class Capture:
             return
 
         b=r.body()
+        if not is_jpeg_data(b):
+            return
 
         p=unique(photo_path)
 
@@ -571,7 +583,7 @@ def grid_mode(page,args,c,media_type:str):
             try:
                 with page.expect_response(
                     lambda response:(
-                        is_full_photo_url(response.url) and mime(response)=='image/jpeg'
+                        is_full_photo_url(response.url) and is_jpeg_response(response)
                         if photo_mode else mime(response)=='video/mp4'
                     ),
                     timeout=int((args.photo_wait if photo_mode else args.video_wait)*1000),
