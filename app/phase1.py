@@ -18,9 +18,6 @@ def mime(r:Response)->str:return (r.headers.get("content-type") or "").split(";"
 def is_jpeg_data(data:bytes)->bool:
     return data.startswith(b'\xff\xd8\xff')
 
-def is_jpeg_response(r:Response)->bool:
-    return is_jpeg_data(r.body())
-
 def url_extension(url:str)->str:
     return Path(urlsplit(url).path).suffix.lower() or "(なし)"
 
@@ -31,9 +28,9 @@ def filename(url:str,fallback:str)->str:
 def is_jpeg_url(url:str)->bool:
     return re.search(r'\.jpe?g$',urlsplit(url).path,re.I) is not None
 
-def is_full_photo_url(url:str)->bool:
+def is_photo_file_url(url:str)->bool:
     path=urlsplit(url).path.lower()
-    return '/files/' in path and is_jpeg_url(url)
+    return '/files/' in path and re.search(r'/thumbnails?/',path) is None
 
 def is_thumbnail_url(url:str)->bool:
     path=urlsplit(url).path.lower()
@@ -41,6 +38,8 @@ def is_thumbnail_url(url:str)->bool:
 
 def photo_output_path(root:Path,url:str,fallback:str)->Path:
     name=filename(url,fallback)
+    if not Path(name).suffix:
+        name+=Path(fallback).suffix
     match=re.fullmatch(r'\d+-(\d{8})-\d+\.jpe?g',name,re.I)
     if match:
         try:
@@ -142,20 +141,22 @@ class Capture:
                 r.url
             )
 
-            if is_full_photo_url(r.url) or is_thumbnail_url(r.url):
+            if is_photo_file_url(r.url):
                 body=r.body()
-                if not is_jpeg_data(body):
-                    print(
-                        "[JPEG判定NG]",
-                        f"URL拡張子={url_extension(r.url)}",
-                        f"Content-Type={mime(r) or '(なし)'}",
-                        f"先頭バイト={body[:16].hex(' ')}",
-                        r.url,
-                    )
-                    return
-                if is_thumbnail_url(r.url):
+                print(
+                    "[写真レスポンス]",
+                    f"URL拡張子={url_extension(r.url)}",
+                    f"Content-Type={mime(r) or '(なし)'}",
+                    f"JPEG={'はい' if is_jpeg_data(body) else 'いいえ'}",
+                    f"先頭バイト={body[:16].hex(' ')}",
+                    r.url,
+                )
+                self.save_photo(r,body)
+
+            elif is_thumbnail_url(r.url):
+                body=r.body()
+                if is_jpeg_data(body):
                     self.s.thumbnail_urls.add(normalize_url(r.url))
-                self.jpeg(r,body)
 
             elif (
                 self.s.audio_active
@@ -165,16 +166,17 @@ class Capture:
 
         except Exception as e:
             print('response error:',e)
-    def jpeg(self,r:Response,body:bytes):
-        if not is_full_photo_url(r.url) or not self.s.download_mode:
+    def save_photo(self,r:Response,body:bytes):
+        if not is_photo_file_url(r.url) or not self.s.download_mode:
             return
 
         key=normalize_url(r.url)
+        fallback_extension='.jpg' if is_jpeg_data(body) else '.bin'
 
         photo_path=photo_output_path(
             self.s.root,
             r.url,
-            f'photo_{self.s.saved_photos+1:06}.jpg'
+            f'photo_{self.s.saved_photos+1:06}{fallback_extension}'
         )
 
         already=photo_path.is_file()
@@ -589,7 +591,7 @@ def grid_mode(page,args,c,media_type:str):
             try:
                 with page.expect_response(
                     lambda response:(
-                        is_full_photo_url(response.url) and is_jpeg_response(response)
+                        is_photo_file_url(response.url)
                         if photo_mode else mime(response)=='video/mp4'
                     ),
                     timeout=int((args.photo_wait if photo_mode else args.video_wait)*1000),
@@ -617,7 +619,7 @@ def grid_mode(page,args,c,media_type:str):
                 else:
                     print(f'[{result_type}] 保存済みまたは未保存: {filename(response.url,"media")}')
             except PlaywrightTimeoutError:
-                expected='JPEG' if photo_mode else 'video/mp4'
+                expected='写真ファイル' if photo_mode else 'video/mp4'
                 print(f'[{media_type.upper()}] 座標クリック ({x:.0f}, {y:.0f}) 後に {expected} 応答がありません')
             except Exception as e:
                 print(f'[{media_type.upper()}] 座標クリック失敗 ({x:.0f}, {y:.0f}):',e)
