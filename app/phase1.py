@@ -28,7 +28,7 @@ def filename(url:str,fallback:str)->str:
 def is_jpeg_url(url:str)->bool:
     return re.search(r'\.jpe?g$',urlsplit(url).path,re.I) is not None
 
-def is_photo_file_url(url:str)->bool:
+def is_media_file_url(url:str)->bool:
     path=urlsplit(url).path.lower()
     return '/files/' in path and re.search(r'/thumbnails?/',path) is None
 
@@ -106,6 +106,7 @@ class State:
     audio_full:list[tuple[str,str,bytes]]=field(default_factory=list)
     audio_parts:list[tuple[int,int,int|None,str,str,bytes]]=field(default_factory=list)
     photo_active:bool=False
+    video_active:bool=False
     audio_active:bool=False
     def load(self):
         self.root.mkdir(parents=True,exist_ok=True)
@@ -128,6 +129,7 @@ class Capture:
     def __init__(self,page:Page,state:State):
         self.page,self.s=page,state
         self.current_thumb_keys=set()
+        self.media_response_count=0
     def start(self):self.page.on('response',self.on_response)
     def stop(self):
         try:self.page.remove_listener('response',self.on_response)
@@ -141,8 +143,9 @@ class Capture:
                 r.url
             )
 
-            if is_photo_file_url(r.url):
+            if self.s.photo_active and is_media_file_url(r.url):
                 body=r.body()
+                self.media_response_count+=1
                 print(
                     "[写真レスポンス]",
                     f"URL拡張子={url_extension(r.url)}",
@@ -153,10 +156,15 @@ class Capture:
                 )
                 self.save_photo(r,body)
 
-            elif is_thumbnail_url(r.url):
+            elif self.s.photo_active and is_thumbnail_url(r.url):
                 body=r.body()
                 if is_jpeg_data(body):
                     self.s.thumbnail_urls.add(normalize_url(r.url))
+
+            elif self.s.video_active and (
+                is_media_file_url(r.url) or mime(r).startswith('video/')
+            ):
+                self.capture_video(r)
 
             elif (
                 self.s.audio_active
@@ -167,7 +175,7 @@ class Capture:
         except Exception as e:
             print('response error:',e)
     def save_photo(self,r:Response,body:bytes):
-        if not is_photo_file_url(r.url) or not self.s.download_mode:
+        if not is_media_file_url(r.url) or not self.s.download_mode:
             return
 
         key=normalize_url(r.url)
@@ -200,10 +208,18 @@ class Capture:
         self.s.save()
 
         print("[SAVE]", p.name)
-    def mp4(self,r:Response):
+    def capture_video(self,r:Response):
         b=r.body(); cr=parse_range(r.headers.get('content-range',''))
         if cr:self.s.video_parts.append((*cr,b))
         else:self.s.video_full.append((r.url,b))
+        self.media_response_count+=1
+        print(
+            "[動画レスポンス]",
+            f"URL拡張子={url_extension(r.url)}",
+            f"Content-Type={mime(r) or '(なし)'}",
+            f"先頭バイト={b[:16].hex(' ')}",
+            r.url,
+        )
     def audio(self,r:Response):
         content_type=mime(r)
         body=r.body()
@@ -275,10 +291,28 @@ def audio_row_positions(page:Page,max_rows:int=7):
     return [(center_x,first_row+row_step*row) for row in range(max_rows)]
 
 def wait_after_media_response(response_received_at:float)->None:
-    """Wait until 0.5 seconds have passed since a successful media response."""
-    remaining=0.5-(time.monotonic()-response_received_at)
+    """Wait until a short post-response settling interval has elapsed."""
+    remaining=1.0-(time.monotonic()-response_received_at)
     if remaining>0:
         time.sleep(remaining)
+
+def wait_for_media_settle(
+    page:Page,
+    capture:Capture,
+    responses_before:int,
+    quiet_period:float,
+    max_wait:float,
+)->None:
+    deadline=time.monotonic()+max_wait
+    last_response_at=time.monotonic()
+    while time.monotonic()<deadline:
+        page.wait_for_timeout(100)
+        if capture.media_response_count!=responses_before:
+            responses_before=capture.media_response_count
+            last_response_at=time.monotonic()
+            continue
+        if time.monotonic()-last_response_at>=quiet_period:
+            return
 
 def wait_for_photo_grid(page:Page,c:Capture,initial_thumbnails:int,minimum_wait:float)->int:
     """Wait for new thumbnail responses to settle after scrolling."""
@@ -559,6 +593,7 @@ def grid_mode(page,args,c,media_type:str):
     photo_mode=media_type=='photo'
     c.s.download_mode=photo_mode
     c.s.photo_active=photo_mode
+    c.s.video_active=not photo_mode
     c.s.root.joinpath(media_type).mkdir(parents=True,exist_ok=True)
     print(f'現在の画面で{media_type}の取得を開始します。')
 
@@ -584,29 +619,37 @@ def grid_mode(page,args,c,media_type:str):
             click_count+=1
             before_saved=processed_count()
             response_received_at=None
-            video_saved=False
             if not photo_mode:
                 c.s.video_full.clear()
                 c.s.video_parts.clear()
+            responses_before=c.media_response_count
             try:
                 with page.expect_response(
                     lambda response:(
-                        is_photo_file_url(response.url)
-                        if photo_mode else mime(response)=='video/mp4'
+                        is_media_file_url(response.url)
+                        if photo_mode else (
+                            is_media_file_url(response.url)
+                            or mime(response).startswith('video/')
+                        )
                     ),
                     timeout=int((args.photo_wait if photo_mode else args.video_wait)*1000),
                 ) as response_info:
                     page.mouse.click(x,y)
                 response=response_info.value
                 response_received_at=time.monotonic()
+                wait_for_media_settle(
+                    page,
+                    c,
+                    responses_before,
+                    quiet_period=1.5 if photo_mode else 3.0,
+                    max_wait=12.0 if photo_mode else 30.0,
+                )
                 if photo_mode:
                     opened_nearby.append((x,y))
                     result_count=c.s.saved_photos
                     result_type='PHOTO'
                 else:
-                    c.mp4(response)
                     saved=save_video(c.s)
-                    video_saved=saved
                     result_count=c.s.saved_videos
                     result_type='VIDEO'
                     if not saved:
@@ -619,27 +662,27 @@ def grid_mode(page,args,c,media_type:str):
                 else:
                     print(f'[{result_type}] 保存済みまたは未保存: {filename(response.url,"media")}')
             except PlaywrightTimeoutError:
-                expected='写真ファイル' if photo_mode else 'video/mp4'
+                expected='写真ファイル' if photo_mode else '動画ファイル'
                 print(f'[{media_type.upper()}] 座標クリック ({x:.0f}, {y:.0f}) 後に {expected} 応答がありません')
             except Exception as e:
                 print(f'[{media_type.upper()}] 座標クリック失敗 ({x:.0f}, {y:.0f}):',e)
                 if not photo_mode and response_received_at is not None:
                     stop_video_scan=True
             finally:
-                if photo_mode or video_saved:
-                    try:
-                        page.keyboard.press('Escape')
-                        print(f'[{media_type.upper()}] Escapeを送信しました')
-                    except Exception as e:
-                        print(f'[{media_type.upper()}] Escape送信に失敗しました:',e)
-                    if response_received_at is not None:
-                        wait_after_media_response(response_received_at)
+                try:
+                    page.keyboard.press('Escape')
+                    page.wait_for_timeout(300)
+                    print(f'[{media_type.upper()}] Escapeを送信しました')
+                except Exception as e:
+                    print(f'[{media_type.upper()}] Escape送信に失敗しました:',e)
+                if response_received_at is not None:
+                    wait_after_media_response(response_received_at)
             if stop_video_scan:
                 break
 
         print(f'この画面のクリック完了: {click_count}/{len(positions)}地点')
         if stop_video_scan:
-            print('[VIDEO] 完全なMP4を保存できなかったため、次のクリックやEscapeは行わず処理を止めます。')
+            print('[VIDEO] 完全なMP4を保存できなかったため、次のクリックを行わず処理を止めます。')
             break
         if processed_count()>=args.max_items:
             break
